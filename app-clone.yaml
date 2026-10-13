@@ -92,12 +92,19 @@ spec:
             # serialisation cost, not database work. /post is still worth
             # it at ~55 KB per load.
             #
-            # Deliberately NOT included: /listings (takes a ?q= search and
-            # pagination, so each combination would need its own key) and
-            # anything behind auth middleware, which can never be shared
-            # between visitors.
+            # /listings is included now: only the BARE path is ever stored,
+            # because CacheGuestPage declines any request with a query
+            # string, so ?q=, ?category= and ?page= still go to the
+            # database. That is fine -- measured 2026-10-13, a filtered
+            # page costs the same ~46 ms / 2 queries as an unfiltered one,
+            # since the expensive part was the COUNT(*) and RouteData
+            # caches that separately. The bare path is the one the nav
+            # links to, so it is the one worth storing.
+            #
+            # Deliberately NOT included: anything behind auth middleware,
+            # which can never be shared between visitors.
             - name: PAGE_CACHE_PATHS
-              value: "/,/post,/terms,/privacy,/cookies,/accessibility,/about"
+              value: "/,/listings,/post,/terms,/privacy,/cookies,/accessibility,/about"
             # Lets the journey load test exercise ad posting without every
             # submission calling Google (which would measure Google's
             # latency and get rate-limited). Must match RECAPTCHA_TOKEN in
