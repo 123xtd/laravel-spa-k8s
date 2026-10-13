@@ -1,0 +1,119 @@
+# Exporters feeding the Prometheus in 10-prometheus.yaml.
+#
+# Both carry prometheus.io/scrape annotations and are picked up by the
+# kubernetes-pods job automatically -- no scrape config edit needed.
+---
+# node-exporter: per-node host CPU (including per-core), memory, disk,
+# network and -- importantly -- swap. During the capacity work the only
+# way to see a node's real CPU was to read `top` off a screen, and the
+# database box could not be seen at all.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-exporter
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: node-exporter
+  template:
+    metadata:
+      labels:
+        app: node-exporter
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9101"
+    spec:
+      # Host namespaces so the exporter reports the node's figures
+      # rather than its own container's.
+      hostNetwork: true
+      hostPID: true
+      # Run everywhere, control planes included -- two of the three
+      # control planes are also carrying real workload.
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: node-exporter
+          image: prom/node-exporter:v1.8.2
+          args:
+            - --path.procfs=/host/proc
+            - --path.sysfs=/host/sys
+            - --path.rootfs=/host/root
+            # Talos mounts a lot of read-only pseudo-filesystems that
+            # are noise in disk metrics.
+            - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+|var/lib/kubelet/.+|host/root/var/lib/kubelet/.+)($|/)
+            - --collector.filesystem.fs-types-exclude=^(autofs|binfmt_misc|bpf|cgroup2?|configfs|debugfs|devpts|devtmpfs|fusectl|hugetlbfs|iso9660|mqueue|nsfs|overlay|proc|procfs|pstore|rpc_pipefs|securityfs|selinuxfs|squashfs|sysfs|tracefs)$
+            # 9100 is taken by Traefik's metrics entrypoint, and
+            # hostNetwork means we share the node's port space.
+            - --web.listen-address=:9101
+          ports:
+            - name: metrics
+              containerPort: 9101
+              hostPort: 9101
+          volumeMounts:
+            - name: proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: sys
+              mountPath: /host/sys
+              readOnly: true
+            - name: root
+              mountPath: /host/root
+              mountPropagation: HostToContainer
+              readOnly: true
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              # No CPU limit, for the same reason as Prometheus: a
+              # throttled exporter goes blind exactly when load is high.
+              memory: "256Mi"
+      volumes:
+        - name: proc
+          hostPath:
+            path: /proc
+        - name: sys
+          hostPath:
+            path: /sys
+        - name: root
+          hostPath:
+            path: /
+---
+# redis-exporter: Redis was the first bottleneck found (capped at 250m
+# and frozen 22% of wall clock). This surfaces the symptoms directly --
+# connected clients, ops/sec, blocked clients, keyspace hit ratio --
+# alongside the cgroup throttling that cAdvisor already provides.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-exporter
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis-exporter
+  template:
+    metadata:
+      labels:
+        app: redis-exporter
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9121"
+    spec:
+      containers:
+        - name: redis-exporter
+          image: oliver006/redis_exporter:v1.67.0
+          env:
+            - name: REDIS_ADDR
+              value: redis://redis.laravel-spa.svc.cluster.local:6379
+          ports:
+            - name: metrics
+              containerPort: 9121
+          resources:
+            requests:
+              cpu: "25m"
+              memory: "32Mi"
+            limits:
+              memory: "128Mi"

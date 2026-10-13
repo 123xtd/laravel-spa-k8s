@@ -1,0 +1,21 @@
+# Anything holding a real credential stays out of version control.
+#
+# The manifests themselves are committed; only the values are excluded.
+# Every committed manifest references credentials through secretKeyRef,
+# so nothing here is needed to READ the configuration — only to apply it.
+
+# Production credentials: database password, AWS/SES keys, the reCAPTCHA
+# secret, app key. See app-secrets.example.yaml for the shape.
+app-secrets.yaml
+
+# Superseded by seaweedfs.yaml (MinIO's images stopped being pullable).
+# Kept on disk because it still holds the minio-credentials Secret, which
+# the old 20 GB volume's data was written under.
+minio.yaml
+
+# Secret manifests the committed files reference. See secrets/README.md.
+secrets/
+
+# Local scratch
+*.local.yaml
+*.tmp.yaml

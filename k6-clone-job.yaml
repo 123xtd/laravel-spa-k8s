@@ -1,0 +1,78 @@
+# Drives the SAME ramp as k6-lb-job.yaml, but at the clone tier
+# (www.foasfo.ca -> laravel-spa-app-clone) instead of the control.
+#
+# Reuses the k6-lb-script ConfigMap from k6-lb-job.yaml, so both sides of
+# the A/B run byte-identical test code and only TARGET_HOST differs. Apply
+# k6-lb-job.yaml first if the ConfigMap does not exist yet.
+#
+# Run the two SEQUENTIALLY, never together: they share the cluster, the
+# database and the ingress, so a concurrent run measures contention
+# instead of the change under test.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: k6-clone
+  namespace: laravel-spa
+spec:
+  parallelism: 4
+  completions: 4
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: k6-clone
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - talos-k27-emb
+                      - talos-u4h-61d
+      containers:
+        - name: k6
+          image: grafana/k6:latest
+          args:
+            - run
+            - /scripts/lb.js
+          env:
+            - name: TARGET_HOST
+              value: "www.foasfo.ca"
+            - name: LB_IP
+              value: "192.168.100.200"
+            - name: AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: loadtest-credentials
+                  key: BASIC_AUTH
+            # 4,000 x 4 pods = 16,000 concurrent visitors, 4x the ramp
+            # that every earlier run used. Raised because the stack now
+            # walks through 4,000 with zero failures and a 0.44s mean --
+            # that ramp can no longer find the ceiling, so it stopped
+            # being a useful measurement.
+            - name: VUS_PER_POD
+              value: "4000"
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+          resources:
+            # Scaled with the VU count. A load generator starved of CPU
+            # or memory under-drives the test and the system looks
+            # healthier than it is -- the worst failure mode here,
+            # because it is indistinguishable from success. Each VU also
+            # holds a response body, and the home page is ~83 KB, so
+            # memory matters as much as CPU at this count.
+            requests:
+              cpu: "4"
+              memory: "3Gi"
+            limits:
+              cpu: "8"
+              memory: "6Gi"
+      volumes:
+        - name: script
+          configMap:
+            name: k6-lb-script

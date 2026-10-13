@@ -1,0 +1,136 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: maintenance-page
+  namespace: laravel-spa
+data:
+  index.html: |
+    <!doctype html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Buy &amp; Sell Page — Be right back</title>
+    <style>
+      :root {
+        --bg: hsl(74 23% 94%);
+        --bg-light: hsl(74 100% 99%);
+        --text: hsl(73 52% 3%);
+        --text-muted: hsl(73 9% 26%);
+        --border: hsl(73 5% 48%);
+        --primary: hsl(66 100% 13%);
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: var(--bg);
+        color: var(--text);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        padding: 24px;
+      }
+      .card {
+        max-width: 440px;
+        width: 100%;
+        background: var(--bg-light);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 40px 32px;
+        text-align: center;
+      }
+      .brand {
+        font-weight: 700;
+        font-size: 1.1rem;
+        color: var(--primary);
+        letter-spacing: 0.02em;
+        margin-bottom: 24px;
+      }
+      h1 {
+        font-size: 1.5rem;
+        margin: 0 0 12px;
+      }
+      p {
+        color: var(--text-muted);
+        line-height: 1.5;
+        margin: 0;
+      }
+    </style>
+    </head>
+    <body>
+      <div class="card">
+        <div class="brand">BUY &amp; SELL PAGE</div>
+        <h1>We&rsquo;ll be right back</h1>
+        <p>We&rsquo;re updating the site and will be back online shortly. Thanks for your patience.</p>
+      </div>
+    </body>
+    </html>
+  default.conf: |
+    server {
+        listen 8080;
+        root /usr/share/nginx/html;
+        error_page 503 /index.html;
+        location / {
+            return 503;
+        }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: maintenance-page
+  namespace: laravel-spa
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: maintenance-page
+  template:
+    metadata:
+      labels:
+        app: maintenance-page
+    spec:
+      containers:
+        - name: nginx
+          image: nginxinc/nginx-unprivileged:alpine
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: page
+              mountPath: /usr/share/nginx/html/index.html
+              subPath: index.html
+            - name: page
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: default.conf
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+      volumes:
+        - name: page
+          configMap:
+            name: maintenance-page
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: maintenance-page
+  namespace: laravel-spa
+spec:
+  selector:
+    app: maintenance-page
+  ports:
+    - port: 80
+      targetPort: 8080

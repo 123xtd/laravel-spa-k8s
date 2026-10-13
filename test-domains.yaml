@@ -1,0 +1,85 @@
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: laravel-spa-test-domains-auth
+  namespace: laravel-spa
+spec:
+  basicAuth:
+    secret: laravel-spa-test-domains-auth
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: laravel-spa-test-domains-http
+  namespace: laravel-spa
+spec:
+  entryPoints:
+    - web
+  routes:
+    - match: Host(`ba-sp.com`) || Host(`www.ba-sp.com`) || Host(`foasfo.com`) || Host(`www.foasfo.com`) || Host(`foasfo.ca`) || Host(`www.foasfo.ca`)
+      kind: Rule
+      services:
+        - name: laravel-spa-app
+          port: 80
+      middlewares:
+        - name: redirect-to-https
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: laravel-spa-test-domains-https
+  namespace: laravel-spa
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`ba-sp.com`) || Host(`foasfo.com`) || Host(`foasfo.ca`)
+      kind: Rule
+      services:
+        - name: laravel-spa-app
+          port: 80
+      middlewares:
+        - name: laravel-spa-test-domains-auth
+    # www.foasfo.ca is deliberately NOT redirected to the apex: it serves
+    # the A/B clone (see app-clone.yaml). It is on the same certificate
+    # and, because it does not end in ".com", Region::current() resolves
+    # it to 'ca' — so the clone sees the identical listings as the real
+    # site and the comparison is fair.
+    #
+    # To retire the clone, move www.foasfo.ca back into the redirect rule
+    # below and delete app-clone.yaml.
+    - match: Host(`www.foasfo.ca`)
+      kind: Rule
+      services:
+        - name: laravel-spa-app-clone
+          port: 80
+      middlewares:
+        - name: laravel-spa-test-domains-auth
+    - match: Host(`www.ba-sp.com`) || Host(`www.foasfo.com`)
+      kind: Rule
+      services:
+        - name: laravel-spa-app
+          port: 80
+      middlewares:
+        - name: laravel-spa-test-domains-auth
+        - name: redirect-www-to-apex
+  tls:
+    secretName: laravel-spa-test-domains-tls
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: laravel-spa-test-domains-cert
+  namespace: laravel-spa
+spec:
+  secretName: laravel-spa-test-domains-tls
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  dnsNames:
+    - ba-sp.com
+    - www.ba-sp.com
+    - foasfo.com
+    - www.foasfo.com
+    - foasfo.ca
+    - www.foasfo.ca

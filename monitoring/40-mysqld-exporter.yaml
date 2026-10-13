@@ -1,0 +1,66 @@
+# mysqld-exporter for the database box at 192.168.100.111.
+#
+# That machine is outside the cluster and exposes ONLY port 3306 -- no
+# SSH, no node-exporter. So this is the only remote visibility into it,
+# and it is worth being clear about the limit: it reports what MySQL
+# knows about itself (queries/sec, rows read, connections, InnoDB state,
+# lock waits) but NOT the host's CPU, load average or swap. Those still
+# have to be read off a screen on the box itself, which is how the
+# 2026-10-13 investigation had to do it.
+#
+# Requires a Secret this manifest does not contain:
+#
+#   kubectl create secret generic mysqld-exporter -n monitoring \
+#     --from-literal=password='<the laravel DB password>'
+#
+# The `laravel` user was granted PROCESS on 2026-10-13, which is what
+# lets the exporter read engine state. Without it, half these metrics
+# are silently missing -- and `information_schema.processlist` shows
+# only the exporter's own connection, which reads as an idle server.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysqld-exporter
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysqld-exporter
+  template:
+    metadata:
+      labels:
+        app: mysqld-exporter
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9104"
+    spec:
+      containers:
+        - name: mysqld-exporter
+          image: prom/mysqld-exporter:v0.16.0
+          args:
+            - --mysqld.address=192.168.100.111:3306
+            - --mysqld.username=laravel
+            # Rows read per second was the metric that exposed the
+            # missing index (1.84 million rows/sec off 1,011 queries).
+            # It lives in the global status collector, on by default.
+            - --collect.global_status
+            - --collect.global_variables
+            - --collect.info_schema.innodb_metrics
+            - --collect.engine_innodb_status
+          env:
+            - name: MYSQLD_EXPORTER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysqld-exporter
+                  key: password
+          ports:
+            - name: metrics
+              containerPort: 9104
+          resources:
+            requests:
+              cpu: "25m"
+              memory: "64Mi"
+            limits:
+              memory: "256Mi"

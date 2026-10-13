@@ -1,0 +1,302 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: laravel-spa-app
+  namespace: laravel-spa
+spec:
+  # 16 -> 24 on 2026-10-13. Honest note on what this bought: very
+  # little. It took FPM workers from 3,200 to 4,800 and moved throughput
+  # only ~4% (516 -> 538 req/s), while the failure rate went slightly
+  # *up* (6.56% -> 7.72%). The p95 did improve (7.58s -> 5.54s).
+  #
+  # That result is what ruled out worker count as the bottleneck: if
+  # each request spends a fixed time waiting (DNS, see dnsConfig below),
+  # more workers just means more requests waiting in parallel, not any
+  # of them finishing sooner. Kept at 24 because the extra headroom and
+  # better tail are worth having, but it is not the fix for anything.
+  replicas: 24
+  selector:
+    matchLabels:
+      app: laravel-spa-app
+  template:
+    metadata:
+      labels:
+        app: laravel-spa-app
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull-secret
+      # Kubernetes' default is ndots:5, which means any hostname with
+      # fewer than 5 dots is tried against the search list FIRST, before
+      # being tried as written. redis.laravel-spa.svc.cluster.local has
+      # four, so every single connection to it attempted
+      #   redis.laravel-spa.svc.cluster.local.laravel-spa.svc.cluster.local
+      #   redis.laravel-spa.svc.cluster.local.svc.cluster.local
+      #   redis.laravel-spa.svc.cluster.local.cluster.local
+      # (all NXDOMAIN) before the real name — and glibc doubles each with
+      # a parallel AAAA lookup. Eight DNS queries per Redis connection,
+      # and PHP caches nothing between requests.
+      #
+      # Measured 2026-10-13: CoreDNS had served 79 MILLION queries per
+      # pod, was burning 2.26 cores, and one replica averaged 8.07ms per
+      # query (vs 0.41ms on the other). Every one of those milliseconds
+      # is a synchronous wait inside a page load.
+      #
+      # ndots:1 makes any dotted name be tried as written first. Nothing
+      # the app talks to relies on search-list expansion.
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "1"
+      containers:
+        - name: app
+          # FROZEN 2026-10-13 as the control side of the A/B against
+          # laravel-spa-app-clone (see app-clone.yaml).
+          #
+          # This was `:latest` with imagePullPolicy: Always, which meant
+          # any pod restart pulled whatever :latest currently resolved
+          # to. With a variant being built and pushed to the same tag,
+          # the control would silently adopt the change on its next
+          # restart and both measurements would be void -- and nothing
+          # would look wrong while it happened.
+          #
+          # A digest is immutable, so this tier now cannot drift
+          # regardless of what CI publishes. The clone stays on :latest
+          # and picks changes up.
+          #
+          # To unfreeze, put `:latest` back and roll the deployment.
+          image: ghcr.io/123xtd/laravel-spa-app@sha256:428bb36da4c58cfacecd02ab5dbc121ba12404bbcafa51e4d08cdc006ad8daa4
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: laravel-spa-secrets
+          # An explicit `env` entry overrides the same key from
+          # `envFrom`, so this corrects REDIS_HOST without editing the
+          # shared secret. The trailing dot makes the name absolute,
+          # which skips the search list regardless of ndots -- belt and
+          # braces alongside the dnsConfig above.
+          env:
+            - name: REDIS_HOST
+              value: redis.laravel-spa.svc.cluster.local.
+            # The root cause behind most 500s under load. With
+            # persistent=false (Laravel's default), every PHP request
+            # opens and tears down its own Redis connection -- and
+            # since sessions AND cache are both on Redis, that is at
+            # least one connect per page view, each needing a fresh DNS
+            # resolution because PHP caches nothing between requests.
+            #
+            # At ~1,400 req/s that overwhelmed CoreDNS, and the logs
+            # (2026-10-13, 250k+ lines on the hot pods) showed exactly
+            # what followed:
+            #   php_network_getaddresses: getaddrinfo for
+            #     redis.laravel-spa.svc.cluster.local. failed: Try again
+            #   RedisException: Operation timed out
+            # That Redis connect timeout is the ~5.0-5.3s wall seen on
+            # every failing request across runs 7, 8 and 9.
+            #
+            # true makes phpredis reuse one connection per worker
+            # process, so connects and DNS lookups drop to roughly zero.
+            # Watch Redis client count after changing this: one per
+            # worker, so 24 pods x 200 children = 4,800 against redis
+            # maxclients (default 10,000).
+            - name: REDIS_PERSISTENT
+              value: "true"
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 82
+            runAsGroup: 82
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            # Bumped from 100m/500m request/limit for load-test capacity
+            # planning (see loadtest/) — the cluster has ~40 vCPU of
+            # headroom across 5 nodes, nowhere near used by the app at
+            # the original tiny allocation. Revisit once a real target
+            # concurrency is known; this isn't a final production value.
+            requests:
+              # Raised from 500m to match real observed usage under load
+              # (700-900m/pod) -- the scheduler places pods by request,
+              # not limit, so an under-stated request let it over-pack
+              # the cluster's undersized 4-core nodes with more pods
+              # than they could actually sustain once those pods burst
+              # toward their CPU limit. This is what was actually
+              # causing the ~42-45% failure rate at 10k VUs, not any
+              # server-side resource exhaustion.
+              cpu: 1000m
+              memory: 768Mi
+            limits:
+              # Raised from "2" on 2026-10-13. At 2 cores the hottest
+              # pods were being cgroup-throttled 100% of periods while
+              # other pods sat under half capacity -- 18,689m used of a
+              # 32,000m budget, with traffic distributed roughly 3:1
+              # because Traefik reuses keep-alive connections and so
+              # pins requests to a backend rather than spreading them
+              # per request. Lifting the ceiling lets a pod receiving
+              # several times its share absorb it instead of freezing,
+              # which is cheaper than solving the balancing itself.
+              #
+              # CPU is compressible: a busy pod can simply share. A CPU
+              # *limit* converts that contention into hard freezes, so a
+              # generous ceiling costs nothing until it is used. Memory
+              # stays capped because that is what protects the node.
+              cpu: "6"
+              memory: 2Gi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: laravel-spa-app
+  namespace: laravel-spa
+spec:
+  selector:
+    app: laravel-spa-app
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: laravel-spa-ssr
+  namespace: laravel-spa
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: laravel-spa-ssr
+  template:
+    metadata:
+      labels:
+        app: laravel-spa-ssr
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull-secret
+      containers:
+        - name: ssr
+          image: ghcr.io/123xtd/laravel-spa-ssr:latest
+          ports:
+            - containerPort: 13714
+          envFrom:
+            - secretRef:
+                name: laravel-spa-secrets
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: laravel-spa-ssr
+  namespace: laravel-spa
+spec:
+  selector:
+    app: laravel-spa-ssr
+  ports:
+    - port: 13714
+      targetPort: 13714
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: laravel-spa-http
+  namespace: laravel-spa
+spec:
+  entryPoints:
+    - web
+  routes:
+    - match: >-
+        Host(`buyandsellpage.com`) || Host(`www.buyandsellpage.com`) ||
+        Host(`buyandsellpage.ca`) || Host(`www.buyandsellpage.ca`)
+      kind: Rule
+      services:
+        - name: laravel-spa-app
+          port: 80
+      middlewares:
+        - name: redirect-to-https
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: redirect-to-https
+  namespace: laravel-spa
+spec:
+  redirectScheme:
+    scheme: https
+    permanent: true
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: redirect-www-to-apex
+  namespace: laravel-spa
+spec:
+  # Strip a leading "www." for any host — works for both .com and .ca.
+  redirectRegex:
+    regex: ^https?://www\.(.+)
+    replacement: https://${1}
+    permanent: true
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: laravel-spa-https
+  namespace: laravel-spa
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`buyandsellpage.com`) || Host(`buyandsellpage.ca`)
+      kind: Rule
+      services:
+        - name: maintenance-page
+          port: 80
+    - match: Host(`www.buyandsellpage.com`) || Host(`www.buyandsellpage.ca`)
+      kind: Rule
+      services:
+        - name: maintenance-page
+          port: 80
+      middlewares:
+        - name: redirect-www-to-apex
+  tls:
+    secretName: buyandsellpage-tls
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: buyandsellpage-cert
+  namespace: laravel-spa
+spec:
+  secretName: buyandsellpage-tls
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  dnsNames:
+    - buyandsellpage.com
+    - www.buyandsellpage.com
+    - buyandsellpage.ca
+    - www.buyandsellpage.ca

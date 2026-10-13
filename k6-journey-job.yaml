@@ -1,0 +1,582 @@
+# Journey-based load test: a simulated population rather than a crowd of
+# identical loops.
+#
+# WHY THIS REPLACES k6-lb-job.yaml FOR CAPACITY WORK
+#
+# Every run before this used `ramping-vus`: N concurrent loops, each
+# hitting / -> /listings -> /listings/{id} with a 1-3s pause, forever.
+# That found five real bottlenecks, so it earned its keep. But as a model
+# of traffic it is brute force:
+#
+#  - It fixes CONCURRENCY, not arrival rate. 16,000 VUs means 16,000
+#    sessions in flight at all times. Sixteen thousand real visitors over
+#    an hour are never all mid-request; peak concurrency is a small
+#    fraction of the user count. The 16,000-VU run almost certainly
+#    corresponds to several times that many real users.
+#  - Every simulated user behaved identically. Nobody posted an ad, saved
+#    a listing, contacted a seller or posted a yard sale -- which are the
+#    expensive operations (writes, uploads, recaptcha) and were therefore
+#    completely untested.
+#  - Costs came out as one aggregate, so there was no way to see what
+#    posting an ad costs versus loading the home page, and therefore no
+#    way to know what to optimise next.
+#
+# This script fixes all three. `ramping-arrival-rate` sets arrivals per
+# second and lets k6 allocate VUs to sustain them, so concurrency becomes
+# an OUTPUT (how many sessions are stuck because the server is slow)
+# rather than a fixed input. Saturation shows up as dropped iterations
+# instead of silently reduced throughput -- which is what hid the
+# collapse in the 16,000-VU run, where 4x the load produced half the work.
+#
+# Measured single-request baselines on the clone, for comparison against
+# the per-step trends this produces:
+#
+#   /                17 ms,  0 queries,  84 KB   (page-cached)
+#   /listings        89 ms,  6 queries,  55 KB   <- most expensive read
+#   /listings/{id}   45 ms,  7 queries,  52 KB
+#   /post            17 ms,  0 queries,  54 KB   (page-cached)
+#
+# PREREQUISITES
+#   1. Test accounts seeded -- see k8s/journey-seed-job.yaml
+#   2. RECAPTCHA_LOAD_TEST_TOKEN set on the target deployment, matching
+#      RECAPTCHA_TOKEN below. Ad posting fails without it (every
+#      submission would call Google and be rate-limited).
+#   3. Run against the clone (www.foasfo.ca). This test WRITES.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-journey-script
+  namespace: laravel-spa
+data:
+  journey.js: |
+    import http from 'k6/http';
+    import { check, sleep } from 'k6';
+    import { Trend, Counter } from 'k6/metrics';
+    import { b64encode, b64decode } from 'k6/encoding';
+
+    const HOST = __ENV.TARGET_HOST || 'www.foasfo.ca';
+    const BASE = `https://${HOST}`;
+    const AUTH = __ENV.AUTH || '';
+    const BASIC = AUTH ? 'Basic ' + b64encode(AUTH) : null;
+    const RECAPTCHA_TOKEN = __ENV.RECAPTCHA_TOKEN || '';
+    const ACCOUNT_COUNT = parseInt(__ENV.ACCOUNT_COUNT || '200', 10);
+    // No default: the password comes from the loadtest-credentials
+    // Secret (see secrets/, gitignored). An empty value fails the login
+    // loudly rather than hardcoding a credential in version control.
+    const ACCOUNT_PASSWORD = __ENV.ACCOUNT_PASSWORD || '';
+    const KNOWN_LISTING = __ENV.KNOWN_LISTING || '';
+    const PHOTO_KB = parseInt(__ENV.PHOTO_KB || '200', 10);
+
+    // Peak arrivals per second across ALL personas. Each scenario takes
+    // its share via the weights below, so changing this one number
+    // rescales the whole population.
+    const PEAK = parseInt(__ENV.PEAK_ARRIVALS || '400', 10);
+
+    // READ personas scale with traffic, so they are a share of arrivals.
+    const WEIGHT = {
+      scroller: 0.55,   // bored, killing time, long think times
+      searcher: 0.28,   // knows what they want, uses search
+      checker:  0.17,   // "is that snowmobile still for sale?"
+    };
+
+    // WRITE personas are FIXED absolute rates, not a share -- and that
+    // distinction matters more than it looks.
+    //
+    // Writes do not scale with browsing. Reads scale with visitors;
+    // posting scales with the (much smaller, largely independent) seller
+    // population. Expressing posting as "2% of arrivals" meant 8 ads/sec
+    // at 400 arrivals/sec -- 691,000 ads a day, which is nonsense for a
+    // classifieds site.
+    //
+    // It also broke the measurement: every published ad fires
+    // HomeFeedInvalidator, flushing both the home feed and the page
+    // cache. At 8 ads/sec that is a cache flush every eighth of a
+    // second, so the page cache would never be hit and the test would
+    // report permanently-cold numbers -- making the caching work look
+    // worthless when it is not.
+    //
+    // These are per-generator, so multiply by 4. Tuned to resemble a
+    // busy-but-real site: a few ads a minute, not a few a second.
+    const WRITE_RATE = {
+      saver:     parseFloat(__ENV.RATE_SAVER     || '2'),    //  8/s site-wide
+      enquirer:  parseFloat(__ENV.RATE_ENQUIRER  || '1'),    //  4/s
+      poster:    parseFloat(__ENV.RATE_POSTER    || '0.08'), // ~1 ad / 3s
+      yardsaler: parseFloat(__ENV.RATE_YARDSALER || '0.02'), // ~1 / 12s
+    };
+
+    // One Trend per journey step, so the summary is a per-activity cost
+    // table instead of a single blended number. This is the whole point
+    // of the rewrite.
+    const T = {
+      home:        new Trend('step_home', true),
+      subcategory: new Trend('step_subcategory', true),
+      listings:    new Trend('step_listings_index', true),
+      search:      new Trend('step_search', true),
+      detail:      new Trend('step_listing_detail', true),
+      login:       new Trend('step_login', true),
+      save:        new Trend('step_save_ad', true),
+      enquire:     new Trend('step_contact_seller', true),
+      postForm:    new Trend('step_post_form', true),
+      postAd:      new Trend('step_publish_ad', true),
+      yardSale:    new Trend('step_post_yard_sale', true),
+    };
+    const stepErrors = new Counter('step_errors');
+    // Separate from step_errors: a login that silently fails makes every
+    // write persona run as a guest and report false passes, so it needs
+    // to be visible on its own in the summary.
+    const loginFailures = new Counter('login_failures');
+
+    // RAMP_UNIT scales the whole timeline so a smoke run can use the
+    // identical script and scenario shape as a full run -- verifying the
+    // personas actually work without waiting 14 minutes to find out one
+    // of them never fired. Full run: '1m'. Smoke: '10s'.
+    const U = __ENV.RAMP_UNIT || '1m';
+    const n = parseInt(U, 10) || 1;
+    const unit = U.endsWith('s') ? 's' : 'm';
+    const dur = (mult) => `${n * mult}${unit}`;
+    const WRITE_DURATION = __ENV.WRITE_DURATION || '14m';
+
+    function stages(weight) {
+      const at = (f) => Math.max(1, Math.round(PEAK * weight * f));
+      return [
+        { duration: dur(1), target: at(0.15) },
+        { duration: dur(2), target: at(0.15) },
+        { duration: dur(1), target: at(0.4) },
+        { duration: dur(2), target: at(0.4) },
+        { duration: dur(1), target: at(0.7) },
+        { duration: dur(2), target: at(0.7) },
+        { duration: dur(1), target: at(1.0) },
+        { duration: dur(3), target: at(1.0) },
+        { duration: dur(1), target: 1 },
+      ];
+    }
+
+    // Read persona: ramps with overall traffic.
+    function readScenario(exec, weight) {
+      return {
+        executor: 'ramping-arrival-rate',
+        exec,
+        timeUnit: '1s',
+        startRate: 1,
+        // Generous headroom: if k6 runs out of VUs it silently stops
+        // hitting the target rate, which looks like the server coping.
+        preAllocatedVUs: Math.max(20, Math.round(PEAK * weight * 3)),
+        maxVUs: Math.max(100, Math.round(PEAK * weight * 40)),
+        stages: stages(weight),
+      };
+    }
+
+    // Write persona: a steady low rate for the whole run, independent of
+    // how hard the read personas are pushing.
+    function writeScenario(exec, ratePerSecond) {
+      return {
+        executor: 'constant-arrival-rate',
+        exec,
+        rate: Math.max(1, Math.round(ratePerSecond * 60)),
+        timeUnit: '1m',
+        duration: WRITE_DURATION,
+        preAllocatedVUs: Math.max(5, Math.ceil(ratePerSecond * 30)),
+        maxVUs: Math.max(20, Math.ceil(ratePerSecond * 200)),
+      };
+    }
+
+    export const options = {
+      hosts: { [HOST]: __ENV.LB_IP || '192.168.100.200' },
+      scenarios: {
+        scroller:  readScenario('scroller', WEIGHT.scroller),
+        searcher:  readScenario('searcher', WEIGHT.searcher),
+        checker:   readScenario('checker',  WEIGHT.checker),
+        saver:     writeScenario('saver',     WRITE_RATE.saver),
+        enquirer:  writeScenario('enquirer',  WRITE_RATE.enquirer),
+        poster:    writeScenario('poster',    WRITE_RATE.poster),
+        yardsaler: writeScenario('yardsaler', WRITE_RATE.yardsaler),
+      },
+      // Reported, not enforced: the run must finish so the whole curve is
+      // visible, including past the breaking point.
+      thresholds: {
+        http_req_failed: ['rate<0.01'],
+        'step_home': ['p(95)<1000'],
+        'step_listings_index': ['p(95)<2000'],
+        'step_publish_ad': ['p(95)<5000'],
+      },
+      // Response bodies are 50-85 KB; at thousands of VUs that is real
+      // generator memory. Only keep them where the script parses one.
+      discardResponseBodies: true,
+    };
+
+    function headers(extra) {
+      const h = Object.assign({}, extra || {});
+      if (BASIC) h.Authorization = BASIC;
+      return h;
+    }
+
+    // Real think time is long-tailed: most clicks are quick, a few are
+    // very slow (someone reading an ad, or distracted). A uniform
+    // 1 + random()*2 -- what the old test used -- understates both ends
+    // and makes arrivals unnaturally regular.
+    function think(medianSeconds, spread) {
+      const u1 = Math.max(Number.EPSILON, Math.random());
+      const u2 = Math.random();
+      const gauss = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+      const t = medianSeconds * Math.exp((spread || 0.6) * gauss);
+      sleep(Math.min(Math.max(t, 0.3), 90));
+    }
+
+    function step(trend, name, fn) {
+      const res = fn();
+      trend.add(res.timings.duration);
+      const ok = check(res, { [name]: (r) => r.status === 200 || r.status === 302 });
+      if (!ok) stepErrors.add(1, { step: name });
+      return res;
+    }
+
+    // For POSTs, status alone proves nothing: Laravel answers a
+    // validation failure with 302 straight back to the submitting page,
+    // which a `200 || 302` check counts as success. That is exactly how
+    // publish_ad, post_yard_sale and contact_seller all reported 100%
+    // passing while creating zero rows.
+    //
+    // A real success redirects somewhere ELSE. Requires redirects: 0 on
+    // the request, or there is no Location header to inspect.
+    const QUESTIONS = [
+      'Is it still available?',
+      'Is the price negotiable?',
+      'Can you hold it for me?',
+      'When can I see it?',
+      'Where is it located for pickup?',
+      'Can you send more photos?',
+    ];
+
+    function writeStep(trend, name, submittedFrom, fn) {
+      const res = fn();
+      trend.add(res.timings.duration);
+      const dest = String(res.headers['Location'] || '');
+      const ok = check(res, {
+        [name]: (r) => r.status === 302 && dest !== '' && !dest.includes(submittedFrom),
+      });
+      if (!ok) stepErrors.add(1, { step: name });
+      return res;
+    }
+
+    function get(path, extra) {
+      return http.get(`${BASE}${path}`, { headers: headers(extra) });
+    }
+
+    // ---- shared journey fragments -------------------------------------
+
+    function loadHome() {
+      return step(T.home, 'home', () => get('/'));
+    }
+
+    // A subcategory view. Today this is client-side only, so it is
+    // modelled as the partial reload it WILL be once Phase 2 lands --
+    // which is also how we will measure whether Phase 2 helped.
+    const CATEGORIES = ['Vehicle', 'Computer', 'Kitchen', 'Furniture', 'Tool', 'Pet'];
+    function viewSubcategory() {
+      const c = CATEGORIES[Math.floor(Math.random() * CATEGORIES.length)];
+      // A plain page load, NOT an Inertia partial.
+      //
+      // Sending X-Inertia without a matching X-Inertia-Version makes
+      // Inertia return 409 Conflict (asset-version mismatch), which is
+      // what made this step fail 100% of the time on the first smoke
+      // run. There is also nothing to fetch partially yet: the
+      // ?category= handling is Phase 2.
+      //
+      // So this measures what a category view costs TODAY -- a full,
+      // uncached home page, since CacheGuestPage excludes any request
+      // carrying a query string. That is deliberately the "before"
+      // number Phase 2 will be compared against.
+      return step(T.subcategory, 'subcategory', () =>
+        get(`/?category=${encodeURIComponent(c)}`));
+    }
+
+    function openListingsIndex() {
+      const res = step(T.listings, 'listings_index', () =>
+        http.get(`${BASE}/listings`, { headers: headers(), responseType: 'text' }));
+      // Anchored to the listings prop. A bare /&quot;id&quot;:(\d+)/ matches the
+      // `categories` prop first ({"id":1,"name":"Electronics"}), so it
+      // returned 1 and every detail/save/contact request 404'd -- the
+      // cause of the detail step's 28% pass rate on the first smoke run.
+      const m = res.body && res.body.match(/&quot;listings&quot;:\{&quot;data&quot;:\[\{&quot;id&quot;:(\d+)/);
+      return m ? m[1] : KNOWN_LISTING;
+    }
+
+    function openDetail(id) {
+      if (!id) return;
+      step(T.detail, 'listing_detail', () => get(`/listings/${id}`));
+    }
+
+    // Per-VU login, cached for the VU's lifetime. Logging in on every
+    // iteration would make the test mostly measure authentication.
+    let session = null;
+    function ensureLoggedIn() {
+      if (session) return true;
+      const email = `loadtest+${(__VU % ACCOUNT_COUNT) + 1}@example.test`;
+      const page = http.get(`${BASE}/login`, { headers: headers(), responseType: 'text' });
+      const token = (page.cookies['XSRF-TOKEN'] || [{}])[0].value;
+      // redirects: 0 is load-bearing. k6 follows redirects by default, so
+      // without it a successful login reports the FINAL page's status
+      // (200) and carries no Location header -- and the 302 check below
+      // then rejects every successful login, locking the write personas
+      // out of their own journeys.
+      const res = step(T.login, 'login', () => http.post(`${BASE}/login`,
+        { email, password: ACCOUNT_PASSWORD },
+        { headers: headers(token ? { 'X-XSRF-TOKEN': decodeURIComponent(token) } : {}),
+          redirects: 0 }));
+
+      // A FAILED login also returns 302 -- straight back to /login with
+      // the validation errors -- so the status alone proves nothing.
+      // Accepting any 302 meant write personas ran unauthenticated and
+      // still reported passes, because the save POST's redirect to
+      // /login counted as success. Verified against the running app: a
+      // successful login sends Location: https://<host>, a failed one
+      // sends .../login.
+      const dest = String(res.headers['Location'] || '');
+      session = res.status === 302 && dest !== '' && !dest.includes('/login');
+      if (!session) loginFailures.add(1);
+      return session;
+    }
+
+    function csrf() {
+      const jar = http.cookieJar().cookiesForURL(BASE);
+      const t = jar['XSRF-TOKEN'];
+      return t ? decodeURIComponent(t[0]) : '';
+    }
+
+    // ---- personas ------------------------------------------------------
+
+    // Bored, killing time. Long think times, lots of browsing, no writes.
+    export function scroller() {
+      loadHome();
+      think(8, 0.7);
+      const rounds = 2 + Math.floor(Math.random() * 3);
+      for (let i = 0; i < rounds; i++) {
+        viewSubcategory();
+        think(6, 0.8);
+      }
+      const id = openListingsIndex();
+      think(5, 0.7);
+      openDetail(id);
+      think(10, 0.9);
+    }
+
+    // Knows what they want. Exercises the unindexed LIKE search, which no
+    // previous test touched.
+    const TERMS = ['snowmobile', 'truck', 'desk', 'fridge', 'bike', 'ski-doo', 'laptop'];
+    export function searcher() {
+      loadHome();
+      think(3, 0.5);
+      const q = TERMS[Math.floor(Math.random() * TERMS.length)];
+      const res = step(T.search, 'search', () =>
+        http.get(`${BASE}/listings?q=${q}`, { headers: headers(), responseType: 'text' }));
+      const m = res.body && res.body.match(/&quot;listings&quot;:\{&quot;data&quot;:\[\{&quot;id&quot;:(\d+)/);
+      think(3, 0.5);
+      openDetail(m ? m[1] : KNOWN_LISTING);
+      think(4, 0.6);
+    }
+
+    // "Is that snowmobile still for sale?" One target, very short session.
+    export function checker() {
+      loadHome();
+      think(2, 0.4);
+      openDetail(KNOWN_LISTING);
+    }
+
+    export function saver() {
+      if (!ensureLoggedIn()) return;
+      loadHome();
+      think(4, 0.6);
+      const id = openListingsIndex();
+      think(3, 0.5);
+      if (id) {
+        step(T.save, 'save_ad', () => http.post(`${BASE}/listings/${id}/save`, {},
+          { headers: headers({ 'X-XSRF-TOKEN': csrf() }), redirects: 0 }));
+      }
+      think(5, 0.7);
+      loadHome();
+    }
+
+    export function enquirer() {
+      if (!ensureLoggedIn()) return;
+      const id = openListingsIndex();
+      think(6, 0.7);
+      if (id) {
+        openDetail(id);
+        think(8, 0.8);
+        // ConversationController::store validates
+        // questions[] against STANDARD_QUESTIONS -- free text is
+        // rejected, which is why this step reported 100% passing while
+        // creating zero conversations.
+        writeStep(T.enquire, 'contact_seller', '/inquiries', () => http.post(`${BASE}/listings/${id}/inquiries`,
+          { 'questions[0]': QUESTIONS[Math.floor(Math.random() * QUESTIONS.length)] },
+          { headers: headers({ 'X-XSRF-TOKEN': csrf() }), redirects: 0 }));
+      }
+    }
+
+    // The heaviest journey: form, photos, preview, publish.
+    const PHOTO = (() => {
+      // Must be an ArrayBuffer, NOT a string.
+      //
+      // b64decode(..., 's') returns a JavaScript string, and JS strings
+      // are UTF-16: every PNG byte above 127 is mangled on the way back
+      // to bytes, so the upload arrives as a corrupt image and Laravel's
+      // `image` rule rejects it. That produced zero listings and zero
+      // yard sales while the status checks reported success. Verified by
+      // reproducing the same POST with curl + a real file, which created
+      // listing 100070 first try.
+      //
+      // Decode to bytes, then copy into a larger zero-filled buffer.
+      // Trailing bytes after IEND are ignored by getimagesize, so this
+      // is a valid image at a realistic upload size.
+      const head = new Uint8Array(b64decode(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+        'std'));
+      const total = Math.max(head.length, PHOTO_KB * 1024);
+      const buf = new Uint8Array(total);
+      buf.set(head, 0);
+      return buf.buffer;
+    })();
+
+    export function poster() {
+      if (!ensureLoggedIn()) return;
+      step(T.postForm, 'post_form', () => get('/post'));
+      think(25, 0.8); // filling in a form takes real time
+      const photos = 3 + Math.floor(Math.random() * 3);
+      const payload = {
+        title: `Load test listing ${__VU}-${__ITER}`,
+        listing_type: 'selling',
+        category_id: 'Vehicle — Snowmobile',
+        description: 'Generated by the journey load test.',
+        price: '1200.00',
+        location: 'Testville',
+        acknowledged_accurate: 'true',
+        g_recaptcha_response: RECAPTCHA_TOKEN,
+      };
+      for (let i = 0; i < photos; i++) {
+        payload[`images[${i}]`] = http.file(PHOTO, `photo${i}.png`, 'image/png');
+      }
+      // Referer matters: without it Laravel's back() on a validation
+      // failure redirects to '/', which is indistinguishable from a
+      // successful redirect. With it, a rejection goes back to /post and
+      // writeStep catches it.
+      writeStep(T.postAd, 'publish_ad', '/post', () => http.post(`${BASE}/post`, payload,
+        { headers: headers({ 'X-XSRF-TOKEN': csrf(), Referer: `${BASE}/post` }), redirects: 0 }));
+      think(6, 0.6);
+    }
+
+    export function yardsaler() {
+      if (!ensureLoggedIn()) return;
+      loadHome();
+      think(20, 0.8);
+      // YardSaleController requires title AND address; `location`,
+      // `starts_at` and `ends_at` are not fields, and photos arrive as
+      // `pictures`, not `images`. Sending the wrong shape made this step
+      // report success while writing nothing.
+      const payload = {
+        title: `Yard sale ${__VU}-${__ITER}`,
+        address: '12 Test Road, Testville',
+        date: 'Saturday 1 December',
+        times: '9am - 2pm',
+        description: 'Generated by the journey load test.',
+        'bundles[0][name]': 'Garage bundle',
+        'bundles[0][items][0]': 'Tools',
+        g_recaptcha_response: RECAPTCHA_TOKEN,
+      };
+      for (let i = 0; i < 2; i++) {
+        payload[`pictures[${i}]`] = http.file(PHOTO, `yard${i}.png`, 'image/png');
+      }
+      writeStep(T.yardSale, 'post_yard_sale', '/yard-sales', () => http.post(`${BASE}/yard-sales`, payload,
+        { headers: headers({ 'X-XSRF-TOKEN': csrf(), Referer: `${BASE}/yard-sales` }), redirects: 0 }));
+      think(8, 0.7);
+    }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: k6-journey
+  namespace: laravel-spa
+spec:
+  parallelism: 4
+  completions: 4
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: k6-journey
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - talos-k27-emb
+                      - talos-u4h-61d
+      containers:
+        - name: k6
+          image: grafana/k6:latest
+          args: ["run", "/scripts/journey.js"]
+          env:
+            - name: TARGET_HOST
+              value: "www.foasfo.ca"
+            - name: LB_IP
+              value: "192.168.100.200"
+            - name: AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: loadtest-credentials
+                  key: BASIC_AUTH
+            # Total peak arrivals/sec across all personas, per generator.
+            # 4 generators x 100 = 400/sec site-wide. Start low; this is
+            # arrivals, not concurrency, so it is NOT comparable to the
+            # old VUS_PER_POD numbers.
+            - name: PEAK_ARRIVALS
+              value: "100"
+            - name: RECAPTCHA_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: loadtest-credentials
+                  key: RECAPTCHA_LOAD_TEST_TOKEN
+            # The stable target for the "returning checker" persona,
+            # created by `php artisan loadtest:seed` (which prints the
+            # id). Also the fallback when a page scrape finds no listing.
+            - name: KNOWN_LISTING
+              value: "100069"
+            # Scales the whole timeline. '1m' is the full ~14 minute run;
+            # '10s' gives the identical ramp shape in ~2.5 minutes, for
+            # verifying the personas work before committing to a long run.
+            - name: RAMP_UNIT
+              value: "1m"
+            - name: WRITE_DURATION
+              value: "14m"
+            - name: ACCOUNT_COUNT
+              value: "200"
+            - name: ACCOUNT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: loadtest-credentials
+                  key: ACCOUNT_PASSWORD
+            - name: PHOTO_KB
+              value: "200"
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+          resources:
+            # A starved generator under-drives the test and looks like
+            # success -- the worst failure mode. Two of four generators
+            # failed to schedule on the 16k run and produced half-load
+            # data that had to be thrown away.
+            requests:
+              cpu: "3"
+              memory: "2Gi"
+            limits:
+              cpu: "8"
+              memory: "6Gi"
+      volumes:
+        - name: script
+          configMap:
+            name: k6-journey-script

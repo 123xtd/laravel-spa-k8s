@@ -1,0 +1,136 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-discovery-script
+  namespace: laravel-spa
+data:
+  discovery.js: |
+    // Capacity discovery: same visitor path as browse.js (home -> listings
+    // index -> a listing detail), but stepped through widening plateaus so
+    // the point where latency and errors turn up is visible as a knee in
+    // the per-stage output, rather than one pass/fail at the end.
+    //
+    // VUS_PER_POD x 4 pods = total simulated concurrent visitors.
+    import http from 'k6/http';
+    import { check, group, sleep } from 'k6';
+    import { Trend } from 'k6/metrics';
+
+    const BASE_URL = __ENV.BASE_URL || 'http://laravel-spa-app.laravel-spa.svc.cluster.local';
+    const V = parseInt(__ENV.VUS_PER_POD || '1000', 10);
+
+    const listingDetailDuration = new Trend('listing_detail_duration');
+
+    export const options = {
+        scenarios: {
+            ramping: {
+                executor: 'ramping-vus',
+                startVUs: 0,
+                stages: [
+                    { duration: '1m', target: Math.round(V * 0.125) },  //  500 total
+                    { duration: '2m', target: Math.round(V * 0.125) },
+                    { duration: '1m', target: Math.round(V * 0.25) },   // 1000 total
+                    { duration: '2m', target: Math.round(V * 0.25) },
+                    { duration: '1m', target: Math.round(V * 0.5) },    // 2000 total
+                    { duration: '2m', target: Math.round(V * 0.5) },
+                    { duration: '1m', target: V },                      // 4000 total
+                    { duration: '2m', target: V },
+                    { duration: '1m', target: 0 },
+                ],
+            },
+        },
+        // Reported, not enforced — the run must reach the end so we can see
+        // the whole curve, including the part past the breaking point.
+        thresholds: {
+            http_req_failed: ['rate<0.01'],
+            http_req_duration: ['p(95)<1500'],
+        },
+    };
+
+    function randomPause() {
+        return 1 + Math.random() * 2;
+    }
+
+    export default function () {
+        group('home page', function () {
+            const res = http.get(`${BASE_URL}/`);
+            check(res, { 'home status 200': (r) => r.status === 200 });
+        });
+
+        sleep(randomPause());
+
+        let listingId = null;
+        group('listings index', function () {
+            const res = http.get(`${BASE_URL}/listings`);
+            check(res, { 'listings status 200': (r) => r.status === 200 });
+            const match = res.body && res.body.match(/&quot;listings&quot;:\{&quot;data&quot;:\[\{&quot;id&quot;:(\d+)/);
+            if (match) {
+                listingId = match[1];
+            }
+        });
+
+        sleep(randomPause());
+
+        if (listingId) {
+            group('listing detail', function () {
+                const res = http.get(`${BASE_URL}/listings/${listingId}`);
+                listingDetailDuration.add(res.timings.duration);
+                check(res, { 'listing detail status 200': (r) => r.status === 200 });
+            });
+        }
+
+        sleep(randomPause());
+    }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: k6-discovery
+  namespace: laravel-spa
+spec:
+  parallelism: 4
+  completions: 4
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: k6-discovery
+    spec:
+      restartPolicy: Never
+      # Load generators belong on the big nodes, away from the 4-core
+      # workers that were already saturating during the October run.
+      # talos-k27-emb is the 32-CPU T440, talos-u4h-61d the 20-CPU box.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - talos-k27-emb
+                      - talos-u4h-61d
+      containers:
+        - name: k6
+          image: grafana/k6:latest
+          args:
+            - run
+            - /scripts/discovery.js
+          env:
+            - name: BASE_URL
+              value: "http://laravel-spa-app.laravel-spa.svc.cluster.local"
+            - name: VUS_PER_POD
+              value: "1000"
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: "1"
+              memory: "512Mi"
+            limits:
+              cpu: "4"
+              memory: "2Gi"
+      volumes:
+        - name: script
+          configMap:
+            name: k6-discovery-script

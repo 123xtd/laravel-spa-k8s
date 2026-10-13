@@ -1,0 +1,23 @@
+# Helm values for the Traefik release (chart traefik-41.3.0, namespace
+# traefik-system). The release was installed 2026-08-24 with no values at
+# all, i.e. pure chart defaults — this file is the first customisation, so
+# keep it as the single source of truth and apply changes with:
+#
+#   helm upgrade traefik traefik/traefik -n traefik-system \
+#     --version 41.3.0 -f k8s/traefik-values.yaml
+#
+# Anything set via `kubectl scale`/`kubectl edit` instead will be silently
+# reverted by the next helm upgrade.
+
+deployment:
+  # Was 1 — a single pod carrying all site traffic, so both a throughput
+  # ceiling and a single point of failure.
+  replicas: 3
+
+additionalArguments:
+  # Default is 200: past that, Traefik stops reusing keep-alive
+  # connections to the backend and opens a fresh one per request, which
+  # is expensive under load. This is a ceiling, not a pre-allocation —
+  # idle connections only exist once they've been opened, so a high value
+  # costs nothing until it's actually used.
+  - "--serverstransport.maxidleconnsperhost=10000"

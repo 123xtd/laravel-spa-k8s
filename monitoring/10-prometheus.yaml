@@ -1,0 +1,287 @@
+# Prometheus for the Talos cluster.
+#
+# Written 2026-10-13 after a capacity investigation where the absence of
+# this cost hours. Two of the three bottlenecks found that day were
+# cgroup CPU throttling (Redis capped at 250m, then the app tier at 2
+# cores), which is invisible in `kubectl top` -- a throttled container
+# reports LOW cpu usage while being completely stalled, so the cluster
+# looked 95% idle while the site collapsed. The metric that exposes it,
+# container_cpu_cfs_throttled_periods_total, comes from cAdvisor and is
+# scraped below. Had this existed, the diagnosis would have been minutes.
+#
+# metrics-server (already installed) is NOT a substitute: it keeps a ~15
+# second rolling window with no history, and exposes neither throttling
+# nor anything about MySQL, Redis or Traefik.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    # Talos enforces PodSecurity "baseline" cluster-wide by default, and
+    # that default does not show up in a namespace's own labels -- so an
+    # unlabelled namespace looks unrestricted but is not. node-exporter
+    # needs hostNetwork, hostPID, hostPath and hostPort, all of which
+    # baseline forbids, so this namespace has to opt out explicitly.
+    # longhorn-system and metallb-system carry the same label for the
+    # same reason; this follows that established pattern.
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: monitoring
+---
+# Read-only cluster access, used for service discovery and for proxying
+# kubelet/cAdvisor scrapes through the API server.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "nodes/proxy", "nodes/metrics", "services", "endpoints", "pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["extensions", "networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+  - nonResourceURLs: ["/metrics", "/metrics/cadvisor"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: monitoring
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+data:
+  prometheus.yml: |
+    global:
+      # 15s is frequent enough to catch a throttling spike inside a
+      # single load-test plateau. The ramps used here hold each level
+      # for two minutes, so this gives ~8 samples per plateau.
+      scrape_interval: 15s
+      evaluation_interval: 15s
+
+    scrape_configs:
+      # ---- cAdvisor: per-container CPU, memory, and THROTTLING ----
+      # Scraped via the API server proxy rather than hitting kubelet
+      # directly on :10250 -- Talos locks the kubelet down, and the
+      # proxy route needs only the RBAC granted above.
+      - job_name: kubernetes-cadvisor
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          insecure_skip_verify: true
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/${1}/proxy/metrics/cadvisor
+
+      # ---- kubelet's own metrics (node-level, volume stats) ----
+      - job_name: kubernetes-kubelet
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          insecure_skip_verify: true
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/${1}/proxy/metrics
+
+      # ---- anything that opts in with an annotation ----
+      # Exporters added later (node-exporter, redis, mysqld) just carry
+      # prometheus.io/scrape: "true" and are picked up automatically,
+      # so this config does not need editing for each one.
+      - job_name: kubernetes-pods
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            regex: (.+)
+            target_label: __metrics_path__
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+
+      # ---- Traefik: request rates, latencies, status codes ----
+      # Already enabled on the deployment (--metrics.prometheus=true on
+      # a dedicated :9100 entrypoint), so this just points at it.
+      - job_name: traefik
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [traefik-system]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+            action: keep
+            regex: traefik
+          - source_labels: [__address__]
+            action: replace
+            regex: ([^:]+)(?::\d+)?
+            replacement: $1:9100
+            target_label: __address__
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+
+      # ---- CoreDNS ----
+      # Added after DNS turned out to be a per-request wait hiding
+      # inside every page load: ndots:5 expansion meant 8 queries per
+      # Redis connection, CoreDNS had served 79 million queries per pod
+      # and was burning 2.26 cores, and one replica averaged 8.07ms per
+      # query against 0.41ms on its sibling. None of that was visible
+      # until it was looked for by hand.
+      #
+      # Watch coredns_dns_requests_total (volume) against
+      # coredns_dns_request_duration_seconds_sum/_count (mean latency);
+      # a healthy cluster record resolves well under 1ms.
+      - job_name: coredns
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [kube-system]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_k8s_app]
+            action: keep
+            regex: kube-dns
+          - source_labels: [__address__]
+            action: replace
+            regex: ([^:]+)(?::\d+)?
+            replacement: $1:9153
+            target_label: __address__
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+
+      - job_name: prometheus
+        static_configs:
+          - targets: ["localhost:9090"]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prometheus-data
+  namespace: monitoring
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: longhorn
+  resources:
+    requests:
+      # 15 days at 15s intervals for a cluster this size fits well
+      # inside this. Longhorn's pool is small, so this is deliberately
+      # modest -- raise it if retention needs extending.
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  replicas: 1
+  strategy:
+    # The PVC is ReadWriteOnce, so the old pod must release it before
+    # the new one can mount it. A rolling update would deadlock.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: prometheus
+      securityContext:
+        # The official image runs as nobody; Longhorn volumes come up
+        # root-owned, so hand the data dir to that uid.
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v3.1.0
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=15d
+            - --web.enable-lifecycle
+          ports:
+            - name: web
+              containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+            - name: data
+              mountPath: /prometheus
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "512Mi"
+            limits:
+              # Deliberately no CPU limit. Throttling a monitoring pod
+              # is how you lose visibility exactly when you need it --
+              # which is the whole lesson of 2026-10-13. Memory is
+              # capped because that protects the node; CPU is
+              # compressible and does not need to be.
+              memory: "2Gi"
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: prometheus-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  selector:
+    app: prometheus
+  ports:
+    - name: web
+      port: 9090
+      targetPort: web

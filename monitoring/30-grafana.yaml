@@ -1,0 +1,261 @@
+# Grafana, reachable on the LAN via MetalLB.
+#
+# The admin password lives in a Secret created out-of-band (see the
+# README next to this file) rather than being committed here.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: monitoring
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus.monitoring.svc.cluster.local:9090
+        isDefault: true
+        jsonData:
+          timeInterval: 15s
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-provider
+  namespace: monitoring
+data:
+  provider.yaml: |
+    apiVersion: 1
+    providers:
+      - name: default
+        orgId: 1
+        folder: ''
+        type: file
+        disableDeletion: false
+        allowUiUpdates: true
+        options:
+          # Deliberately not under /var/lib/grafana -- that path is the
+          # PVC mount, and nesting a ConfigMap mount inside it is a
+          # fragile arrangement that can shadow the volume.
+          path: /etc/grafana/dashboards
+---
+# One purpose-built dashboard rather than a generic import. The panel
+# order is the order the 2026-10-13 investigation actually needed:
+# throttling first (it was the answer twice and is invisible in
+# `kubectl top`), then CPU against its limit, then what visitors
+# experienced, then the backing services.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-capacity
+  namespace: monitoring
+data:
+  capacity.json: |
+    {
+      "title": "Capacity & Bottlenecks",
+      "uid": "capacity",
+      "timezone": "browser",
+      "refresh": "15s",
+      "time": { "from": "now-1h", "to": "now" },
+      "panels": [
+        {
+          "type": "timeseries",
+          "title": "CPU throttling % by pod  (>0 means frozen against its limit)",
+          "description": "The metric that found both the Redis and app-tier bottlenecks. A throttled container reports LOW cpu usage while being stalled, so it is invisible in kubectl top. Anything sustained above ~5% is costing latency.",
+          "gridPos": { "h": 9, "w": 24, "x": 0, "y": 0 },
+          "fieldConfig": {
+            "defaults": { "unit": "percentunit", "min": 0, "custom": { "fillOpacity": 10 } }
+          },
+          "targets": [
+            {
+              "expr": "sum by (namespace, pod) (rate(container_cpu_cfs_throttled_periods_total{container!=\"\"}[5m])) / clamp_min(sum by (namespace, pod) (rate(container_cpu_cfs_periods_total{container!=\"\"}[5m])), 1)",
+              "legendFormat": "{{namespace}}/{{pod}}"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "CPU used vs limit, by workload",
+          "description": "Solid lines are usage, the limit is the ceiling they cannot cross. Usage flat against a limit while latency climbs is throttling, not saturation.",
+          "gridPos": { "h": 9, "w": 12, "x": 0, "y": 9 },
+          "fieldConfig": { "defaults": { "unit": "none", "min": 0 } },
+          "targets": [
+            {
+              "expr": "sum by (namespace) (rate(container_cpu_usage_seconds_total{container!=\"\",namespace=~\"laravel-spa|monitoring|traefik-system\"}[5m]))",
+              "legendFormat": "{{namespace}} used"
+            },
+            {
+              "expr": "sum by (namespace) (container_spec_cpu_quota{container!=\"\",namespace=~\"laravel-spa|monitoring|traefik-system\"} / container_spec_cpu_period)",
+              "legendFormat": "{{namespace}} LIMIT"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Node CPU busy %",
+          "description": "Per-node host CPU from node-exporter. The database box at .111 is NOT here - it is outside the cluster with only 3306 reachable.",
+          "gridPos": { "h": 9, "w": 12, "x": 12, "y": 9 },
+          "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 } },
+          "targets": [
+            {
+              "expr": "1 - avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[5m]))",
+              "legendFormat": "{{instance}}"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Request rate by service",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
+          "fieldConfig": { "defaults": { "unit": "reqps", "min": 0 } },
+          "targets": [
+            {
+              "expr": "sum by (service) (rate(traefik_service_requests_total[5m]))",
+              "legendFormat": "{{service}}"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Request duration p95  (what a visitor waits)",
+          "description": "The number that went from 60s to 8.67s on 2026-10-13. Watch this during a load test, not the average - the average hides a collapsing tail.",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
+          "fieldConfig": { "defaults": { "unit": "s", "min": 0 } },
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.95, sum by (le, service) (rate(traefik_service_request_duration_seconds_bucket[5m])))",
+              "legendFormat": "p95 {{service}}"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "HTTP 5xx rate",
+          "gridPos": { "h": 7, "w": 12, "x": 0, "y": 26 },
+          "fieldConfig": { "defaults": { "unit": "reqps", "min": 0 } },
+          "targets": [
+            {
+              "expr": "sum by (code) (rate(traefik_service_requests_total{code=~\"5..\"}[5m]))",
+              "legendFormat": "{{code}}"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Redis: ops/sec and connected clients",
+          "description": "Clients tracks pm.max_children x replicas - it reached 3,214 under load, one per PHP-FPM worker.",
+          "gridPos": { "h": 7, "w": 12, "x": 12, "y": 26 },
+          "fieldConfig": { "defaults": { "min": 0 } },
+          "targets": [
+            { "expr": "rate(redis_commands_processed_total[5m])", "legendFormat": "ops/sec" },
+            { "expr": "redis_connected_clients", "legendFormat": "connected clients" }
+          ]
+        }
+      ]
+    }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grafana-data
+  namespace: monitoring
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      securityContext:
+        runAsUser: 472
+        runAsGroup: 472
+        fsGroup: 472
+      containers:
+        - name: grafana
+          image: grafana/grafana:11.5.1
+          env:
+            - name: GF_SECURITY_ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: grafana-admin
+                  key: username
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: grafana-admin
+                  key: password
+            # No anonymous access: this is reachable on the LAN.
+            - name: GF_AUTH_ANONYMOUS_ENABLED
+              value: "false"
+            - name: GF_ANALYTICS_REPORTING_ENABLED
+              value: "false"
+            - name: GF_ANALYTICS_CHECK_FOR_UPDATES
+              value: "false"
+          ports:
+            - name: http
+              containerPort: 3000
+          volumeMounts:
+            - name: datasources
+              mountPath: /etc/grafana/provisioning/datasources
+            - name: dashboard-provider
+              mountPath: /etc/grafana/provisioning/dashboards
+            - name: dashboards
+              mountPath: /etc/grafana/dashboards
+            - name: data
+              mountPath: /var/lib/grafana
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              memory: "1Gi"
+      volumes:
+        - name: datasources
+          configMap:
+            name: grafana-datasources
+        - name: dashboard-provider
+          configMap:
+            name: grafana-dashboard-provider
+        - name: dashboards
+          configMap:
+            name: grafana-dashboard-capacity
+        - name: data
+          persistentVolumeClaim:
+            claimName: grafana-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: monitoring
+  annotations:
+    # Traefik already holds .200 from the same MetalLB pool
+    # (192.168.100.200-210); pin this so the bookmark never moves.
+    metallb.universe.tf/loadBalancerIPs: 192.168.100.201
+spec:
+  type: LoadBalancer
+  selector:
+    app: grafana
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http

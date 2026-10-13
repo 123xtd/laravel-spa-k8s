@@ -1,0 +1,157 @@
+# A full clone of the app tier, for A/B testing changes against the real
+# site under identical conditions.
+#
+# Built 2026-10-13. The capacity work up to that point compared load-test
+# runs taken hours apart, with the cluster in different states each time
+# -- fine for finding order-of-magnitude problems, useless for judging a
+# change worth a few percent. This lets a change be measured against an
+# unmodified control on the same hardware, with the same data, through
+# the same ingress.
+#
+#   real site : https://foasfo.ca      -> laravel-spa-app        (control)
+#   clone     : https://www.foasfo.ca  -> laravel-spa-app-clone  (variant)
+#
+# What is shared, deliberately, so the comparison is fair:
+#   - the same MySQL database. Both hosts end in something other than
+#     ".com", so Region::current() resolves both to 'ca' and they see
+#     the identical 68,062 listings. The read path under test does not
+#     write, so sharing is safe.
+#   - the same Traefik, the same TLS certificate (www.foasfo.ca is
+#     already a SAN on it), the same basic-auth middleware. Identical
+#     network path end to end.
+#   - the same image, resources and replica count.
+#
+# What is isolated, so the two cannot contaminate each other:
+#   - Redis database indexes. The clone uses 2 and 3 where the real site
+#     uses 0 and 1, so sessions and cache are entirely separate. Without
+#     this, a cache fix on the clone would silently serve the real site
+#     too and both measurements would be meaningless.
+#
+# Run load tests SEQUENTIALLY, never both at once -- they share the
+# cluster, the database and the ingress, so concurrent runs would
+# measure contention rather than the change. Idle pods cost ~50m each,
+# so leaving both deployments up between runs is cheap.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: laravel-spa-app-clone
+  namespace: laravel-spa
+spec:
+  # Matches the real tier exactly. If one side has more capacity than
+  # the other, the comparison measures the replica count, not the change.
+  replicas: 24
+  selector:
+    matchLabels:
+      app: laravel-spa-app-clone
+  template:
+    metadata:
+      labels:
+        app: laravel-spa-app-clone
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull-secret
+      # Same DNS treatment as the real tier -- see app-deployment.yaml
+      # for why ndots:5 was costing 8 lookups per Redis connection.
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "1"
+      containers:
+        - name: app
+          image: ghcr.io/123xtd/laravel-spa-app:latest
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: laravel-spa-secrets
+          env:
+            - name: REDIS_HOST
+              value: redis.laravel-spa.svc.cluster.local.
+            - name: REDIS_PERSISTENT
+              value: "true"
+            # The isolation that makes this a clone rather than a second
+            # copy of the same thing. Real site: 0 (sessions) and 1
+            # (cache). Clone: 2 and 3.
+            - name: REDIS_DB
+              value: "2"
+            - name: REDIS_CACHE_DB
+              value: "3"
+            # THE VARIANT UNDER TEST. Set here and nowhere else, so the
+            # two tiers run identical code and differ only by this flag
+            # -- which is what makes the comparison attributable to the
+            # change rather than to any drift between them.
+            #
+            # See config/pagecache.php. Off by default in config, so the
+            # real site stays unaffected even if it is ever unfrozen.
+            - name: PAGE_CACHE_ENABLED
+              value: "true"
+            # '/' is the expensive one (28 queries, ~83 KB). The rest are
+            # already query-free -- their props are static PHP arrays or
+            # nothing at all -- so caching them saves render and
+            # serialisation cost, not database work. /post is still worth
+            # it at ~55 KB per load.
+            #
+            # Deliberately NOT included: /listings (takes a ?q= search and
+            # pagination, so each combination would need its own key) and
+            # anything behind auth middleware, which can never be shared
+            # between visitors.
+            - name: PAGE_CACHE_PATHS
+              value: "/,/post,/terms,/privacy,/cookies,/accessibility,/about"
+            # Lets the journey load test exercise ad posting without every
+            # submission calling Google (which would measure Google's
+            # latency and get rate-limited). Must match RECAPTCHA_TOKEN in
+            # k8s/k6-journey-job.yaml.
+            #
+            # This is NOT a switch that disables recaptcha: only a
+            # submission carrying this exact token skips verification, so
+            # real bot protection stays intact even here. See
+            # app/Rules/Recaptcha.php and the adversarial tests in
+            # tests/Feature/RecaptchaLoadTestTokenTest.php.
+            #
+            # NEVER set this on the real site (laravel-spa-app). It also
+            # gates `php artisan loadtest:seed`, which refuses to create
+            # bulk fake accounts without it.
+            - name: RECAPTCHA_LOAD_TEST_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: loadtest-credentials
+                  key: RECAPTCHA_LOAD_TEST_TOKEN
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 82
+            runAsGroup: 82
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 1000m
+              memory: 768Mi
+            limits:
+              cpu: "6"
+              memory: 2Gi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: laravel-spa-app-clone
+  namespace: laravel-spa
+spec:
+  selector:
+    app: laravel-spa-app-clone
+  ports:
+    - port: 80
+      targetPort: 8080

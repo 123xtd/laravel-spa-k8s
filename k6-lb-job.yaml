@@ -1,0 +1,159 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-lb-script
+  namespace: laravel-spa
+data:
+  lb.js: |
+    // Same stepped ramp as the discovery test, but driven through the
+    // REAL visitor path: MetalLB (192.168.100.200) -> Traefik -> TLS ->
+    // app. The earlier runs hit the app Service directly over cluster
+    // DNS, which skipped the ingress entirely.
+    //
+    // `hosts` maps the real hostname onto the LoadBalancer IP, so TLS SNI
+    // and certificate validation still work against the real cert —
+    // cleaner than overriding a Host header and disabling verification.
+    import http from 'k6/http';
+    import { check, group, sleep } from 'k6';
+    import { Trend } from 'k6/metrics';
+    import { b64encode } from 'k6/encoding';
+
+    // TARGET_HOST picks which tier to drive, so one script serves both
+    // sides of the A/B (see k8s/app-clone.yaml):
+    //   foasfo.ca      -> laravel-spa-app        (control)
+    //   www.foasfo.ca  -> laravel-spa-app-clone  (variant)
+    // Both are SANs on the same certificate and both resolve to region
+    // 'ca', so the two runs are directly comparable.
+    const HOST = __ENV.TARGET_HOST || 'foasfo.ca';
+    const BASE_URL = __ENV.BASE_URL || `https://${HOST}`;
+    const AUTH = __ENV.AUTH || '';
+    const AUTH_HEADER = AUTH ? 'Basic ' + b64encode(AUTH) : null;
+    const V = parseInt(__ENV.VUS_PER_POD || '1000', 10);
+
+    const listingDetailDuration = new Trend('listing_detail_duration');
+
+    export const options = {
+        hosts: { [HOST]: __ENV.LB_IP || '192.168.100.200' },
+        scenarios: {
+            ramping: {
+                executor: 'ramping-vus',
+                startVUs: 0,
+                stages: [
+                    { duration: '1m', target: Math.round(V * 0.125) },  //  500 total
+                    { duration: '2m', target: Math.round(V * 0.125) },
+                    { duration: '1m', target: Math.round(V * 0.25) },   // 1000 total
+                    { duration: '2m', target: Math.round(V * 0.25) },
+                    { duration: '1m', target: Math.round(V * 0.5) },    // 2000 total
+                    { duration: '2m', target: Math.round(V * 0.5) },
+                    { duration: '1m', target: V },                      // 4000 total
+                    { duration: '2m', target: V },
+                    { duration: '1m', target: 0 },
+                ],
+            },
+        },
+        // Reported, not enforced — the run must finish so the whole curve
+        // is visible, including past the breaking point.
+        thresholds: {
+            http_req_failed: ['rate<0.01'],
+            http_req_duration: ['p(95)<1500'],
+        },
+    };
+
+    function headers() {
+        return AUTH_HEADER ? { Authorization: AUTH_HEADER } : {};
+    }
+
+    function randomPause() {
+        return 1 + Math.random() * 2;
+    }
+
+    export default function () {
+        group('home page', function () {
+            const res = http.get(`${BASE_URL}/`, { headers: headers() });
+            check(res, { 'home status 200': (r) => r.status === 200 });
+        });
+
+        sleep(randomPause());
+
+        let listingId = null;
+        group('listings index', function () {
+            const res = http.get(`${BASE_URL}/listings`, { headers: headers() });
+            check(res, { 'listings status 200': (r) => r.status === 200 });
+            const match = res.body && res.body.match(/&quot;listings&quot;:\{&quot;data&quot;:\[\{&quot;id&quot;:(\d+)/);
+            if (match) {
+                listingId = match[1];
+            }
+        });
+
+        sleep(randomPause());
+
+        if (listingId) {
+            group('listing detail', function () {
+                const res = http.get(`${BASE_URL}/listings/${listingId}`, { headers: headers() });
+                listingDetailDuration.add(res.timings.duration);
+                check(res, { 'listing detail status 200': (r) => r.status === 200 });
+            });
+        }
+
+        sleep(randomPause());
+    }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: k6-lb
+  namespace: laravel-spa
+spec:
+  parallelism: 4
+  completions: 4
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: k6-lb
+    spec:
+      restartPolicy: Never
+      # Keep generators on the big nodes. TLS makes this run costlier to
+      # drive than the plain-HTTP one, so give them room.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - talos-k27-emb
+                      - talos-u4h-61d
+      containers:
+        - name: k6
+          image: grafana/k6:latest
+          args:
+            - run
+            - /scripts/lb.js
+          env:
+            - name: BASE_URL
+              value: "https://foasfo.ca"
+            - name: LB_IP
+              value: "192.168.100.200"
+            - name: AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: loadtest-credentials
+                  key: BASIC_AUTH
+            - name: VUS_PER_POD
+              value: "1000"
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: "2"
+              memory: "1Gi"
+            limits:
+              cpu: "6"
+              memory: "3Gi"
+      volumes:
+        - name: script
+          configMap:
+            name: k6-lb-script

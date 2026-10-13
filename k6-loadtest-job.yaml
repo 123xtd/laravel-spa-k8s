@@ -1,0 +1,155 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-browse-script
+  namespace: laravel-spa
+data:
+  browse.js: |
+    // Read-heavy browsing load test: home -> listings index -> a listing
+    // detail page, mimicking the common visitor path. Targets a single
+    // BASE_URL (point it at foasfo.ca/.com, which share the real production
+    // backend, or at buyandsellpage.ca/.com once they're live again).
+    //
+    // Run:
+    //   k6 run -e BASE_URL=https://foasfo.ca -e AUTH=<user>:<password> -e TARGET_VUS=1000 loadtest/browse.js
+    //
+    // Ramps virtual users gradually through fractions of TARGET_VUS (default
+    // 200) rather than jumping straight there, so the point where things
+    // start degrading is visible in the per-stage breakdown, not just a
+    // single pass/fail number at the end.
+
+    import http from 'k6/http';
+    import { check, group, sleep } from 'k6';
+    import { Trend } from 'k6/metrics';
+    import { b64encode } from 'k6/encoding';
+
+    const BASE_URL = __ENV.BASE_URL || 'https://foasfo.ca';
+    const AUTH = __ENV.AUTH || ''; // "user:pass" for the test-domain Basic Auth wall; leave empty for the real domains.
+    const AUTH_HEADER = AUTH ? 'Basic ' + b64encode(AUTH) : null;
+    const TARGET_VUS = parseInt(__ENV.TARGET_VUS || '200', 10);
+
+    const listingDetailDuration = new Trend('listing_detail_duration');
+
+    function step(fraction) {
+        return Math.max(1, Math.round(TARGET_VUS * fraction));
+    }
+
+    export const options = {
+        scenarios: {
+            ramping: {
+                executor: 'ramping-vus',
+                startVUs: 0,
+                stages: [
+                    { duration: '1m', target: step(0.1) },
+                    { duration: '2m', target: step(0.1) },
+                    { duration: '1m', target: step(0.4) },
+                    { duration: '2m', target: step(0.4) },
+                    { duration: '1m', target: step(1.0) },
+                    { duration: '3m', target: step(1.0) },
+                    { duration: '1m', target: 0 },
+                ],
+            },
+        },
+        thresholds: {
+            http_req_failed: ['rate<0.01'],
+            http_req_duration: ['p(95)<1500'],
+        },
+    };
+
+    function headers() {
+        return AUTH_HEADER ? { Authorization: AUTH_HEADER } : {};
+    }
+
+    function randomPause() {
+        // 1-3s between actions, roughly how a real visitor pauses between pages.
+        return 1 + Math.random() * 2;
+    }
+
+    export default function () {
+        group('home page', function () {
+            const res = http.get(`${BASE_URL}/`, { headers: headers() });
+            check(res, { 'home status 200': (r) => r.status === 200 });
+        });
+
+        sleep(randomPause());
+
+        let listingId = null;
+        group('listings index', function () {
+            const res = http.get(`${BASE_URL}/listings`, { headers: headers() });
+            check(res, { 'listings status 200': (r) => r.status === 200 });
+            // Listing data arrives as HTML-entity-escaped JSON inside Inertia's
+            // data-page attribute: ...&quot;listings&quot;:{&quot;data&quot;:[{&quot;id&quot;:53,...
+            const match = res.body && res.body.match(/&quot;listings&quot;:\{&quot;data&quot;:\[\{&quot;id&quot;:(\d+)/);
+            if (match) {
+                listingId = match[1];
+            }
+        });
+
+        sleep(randomPause());
+
+        if (listingId) {
+            group('listing detail', function () {
+                const res = http.get(`${BASE_URL}/listings/${listingId}`, { headers: headers() });
+                listingDetailDuration.add(res.timings.duration);
+                check(res, { 'listing detail status 200': (r) => r.status === 200 });
+            });
+        }
+
+        sleep(randomPause());
+    }
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: k6-browse-10000
+  namespace: laravel-spa
+spec:
+  parallelism: 4
+  completions: 4
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: k6-loadtest
+    spec:
+      restartPolicy: Never
+      # Keep the load generator off the undersized 4-core nodes so it
+      # doesn't compete with app pods there for scarce capacity -- those
+      # 3 nodes were already hitting 90-100% CPU on their own. Pinned to
+      # the 20-core and 8-core nodes instead.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - talos-u4h-61d
+                      - talos-36o-0vq
+      containers:
+        - name: k6
+          image: grafana/k6:latest
+          args:
+            - run
+            - /scripts/browse.js
+          env:
+            - name: BASE_URL
+              value: "http://laravel-spa-app.laravel-spa.svc.cluster.local"
+            - name: TARGET_VUS
+              value: "2500"
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: "2"
+              memory: 1Gi
+            limits:
+              cpu: "4"
+              memory: 3Gi
+      volumes:
+        - name: script
+          configMap:
+            name: k6-browse-script

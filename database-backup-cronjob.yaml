@@ -1,0 +1,95 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: database-backup
+  namespace: laravel-spa
+spec:
+  schedule: "0 4 * * *"
+  # Central Time, same as yard-sales-prune-ended — offset an hour later
+  # (4am vs 3am) so the two scheduled jobs don't compete for resources.
+  timeZone: "America/Chicago"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 7
+  failedJobsHistoryLimit: 7
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+            - name: ghcr-pull-secret
+          # Lets both containers' non-root users (999 for the mysql
+          # image, 82/www-data for the app image) write to and read
+          # from the shared emptyDir below.
+          securityContext:
+            fsGroup: 999
+          volumes:
+            - name: dump
+              emptyDir: {}
+          # The dump and the upload are deliberately two different
+          # images: the app image runs as a non-root user and can't
+          # install mysqldump at run time, so an official MySQL image
+          # (which already has it) does the dump into a shared volume,
+          # then the app image uploads that file to MinIO — see
+          # App\Console\Commands\BackupDatabase.
+          initContainers:
+            - name: dump
+              image: mysql:8.0
+              envFrom:
+                - secretRef:
+                    name: laravel-spa-secrets
+              command:
+                - sh
+                - -c
+                - >
+                  mysqldump --single-transaction --quick --no-tablespaces
+                  --host="$DB_HOST" --port="$DB_PORT"
+                  --user="$DB_USERNAME" --password="$DB_PASSWORD"
+                  "$DB_DATABASE" | gzip > /dump/backup.sql.gz
+              volumeMounts:
+                - name: dump
+                  mountPath: /dump
+              securityContext:
+                allowPrivilegeEscalation: false
+                runAsNonRoot: true
+                runAsUser: 999
+                runAsGroup: 999
+                capabilities:
+                  drop: ["ALL"]
+                seccompProfile:
+                  type: RuntimeDefault
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+          containers:
+            - name: upload
+              image: ghcr.io/123xtd/laravel-spa-app:latest
+              command: ["php", "artisan", "backup:upload", "/dump/backup.sql.gz"]
+              workingDir: /var/www/html
+              envFrom:
+                - secretRef:
+                    name: laravel-spa-secrets
+              volumeMounts:
+                - name: dump
+                  mountPath: /dump
+              securityContext:
+                allowPrivilegeEscalation: false
+                runAsNonRoot: true
+                runAsUser: 82
+                runAsGroup: 82
+                capabilities:
+                  drop: ["ALL"]
+                seccompProfile:
+                  type: RuntimeDefault
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  cpu: 250m
+                  memory: 256Mi

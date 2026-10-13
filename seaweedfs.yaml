@@ -1,0 +1,170 @@
+# SeaweedFS, replacing MinIO as the S3-compatible object store.
+#
+# WHY THE SWAP (2026-10-13)
+#
+# MinIO's container images stopped being anonymously pullable. Verified
+# from inside this cluster:
+#
+#   minio/minio:latest                      pull access denied
+#   quay.io/minio/minio:latest              pull access denied
+#   quay.io/minio/minio:RELEASE.2023-09-04  pull access denied
+#   alpine:3.20                             OK   <- Docker Hub is fine
+#
+# So it is not rate limiting, a bad tag, or a network problem -- it is a
+# deliberate distribution change on MinIO's side, and no amount of
+# version pinning fixes it. The deployment sat in ImagePullBackOff for
+# 20+ hours (5,448 retries), which meant Storage::disk('s3') failed and
+# no photo could be stored at all.
+#
+# SeaweedFS is Apache-2.0, actively maintained, pulls anonymously, and
+# speaks the S3 API -- so the app needs no code change.
+#
+# TWO DELIBERATE DECISIONS
+#
+# 1. The Service is still called `minio`. That name is now a lie, and
+#    the comment on it says so -- but AWS_ENDPOINT lives in the SHARED
+#    laravel-spa-secrets, consumed by both the real site and the
+#    digest-frozen A/B control. Renaming it would mean editing a secret
+#    both tiers read, during an experiment, for cosmetic benefit.
+#    Rename it when the A/B is finished.
+#
+# 2. Data lives in /data/seaweedfs, a SUBDIRECTORY of the existing
+#    volume, not at /data. SeaweedFS cannot read MinIO's on-disk format,
+#    so the 55 existing photos (all on test accounts: 45 on
+#    test@example.com, 10 on cranberian8@gmail.com) are not migrated --
+#    but keeping them in place means they can still be extracted by hand
+#    later if that ever matters, instead of being overwritten now.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: laravel-spa
+spec:
+  replicas: 1
+  strategy:
+    # The PVC is ReadWriteOnce, so a rolling update would deadlock
+    # waiting for a volume the old pod still holds.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      securityContext:
+        fsGroup: 1000
+        runAsUser: 1000
+        runAsGroup: 1000
+      initContainers:
+        # SeaweedFS refuses to start if its -dir does not already exist
+        # ("Check Meta Folder ... no such file or directory") -- it will
+        # not create it. Since the data deliberately lives in a
+        # subdirectory to avoid overwriting MinIO's files, something has
+        # to make that subdirectory first.
+        - name: init-data-dir
+          image: busybox:1.36
+          command: ["sh", "-c", "mkdir -p /data/seaweedfs && echo created /data/seaweedfs"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      containers:
+        - name: minio
+          image: chrislusf/seaweedfs:latest
+          # `weed server` runs master + volume + filer + s3 in one
+          # process, which is the right shape for a single-node store.
+          # s3.port is forced to 9000 (SeaweedFS defaults to 8333) so the
+          # Service and AWS_ENDPOINT stay exactly as they were.
+          args:
+            - server
+            - -dir=/data/seaweedfs
+            - -s3
+            - -s3.port=9000
+            - -s3.config=/etc/seaweedfs/s3.json
+            - -master.volumeSizeLimitMB=1024
+            - -volume.max=0
+            - -metricsPort=9321
+          ports:
+            - containerPort: 9000
+              name: api
+            - containerPort: 8888
+              name: filer
+            - containerPort: 9333
+              name: master
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              # No CPU limit: throttling object storage during a load
+              # test produces upload failures that look like app bugs.
+              memory: 1Gi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: s3-config
+              mountPath: /etc/seaweedfs
+          # A TCP probe rather than an HTTP path: SeaweedFS's S3 endpoint
+          # answers unauthenticated requests with a SigV4 error, not a
+          # 200, so an httpGet probe would mark a healthy pod unready.
+          readinessProbe:
+            tcpSocket:
+              port: 9000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 9000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: minio-data
+        - name: s3-config
+          # A Secret, not a ConfigMap: it holds the S3 access/secret pair.
+          # Created from secrets/seaweedfs-s3-secret.yaml, which is
+          # gitignored -- apply that before this.
+          secret:
+            secretName: seaweedfs-s3-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: laravel-spa
+  annotations:
+    # The name is historical: this Service now fronts SeaweedFS, not
+    # MinIO. It is kept because AWS_ENDPOINT in the shared
+    # laravel-spa-secrets points at minio.laravel-spa.svc.cluster.local
+    # and both app tiers read that secret. See the header comment.
+    app.kubernetes.io/name: seaweedfs
+spec:
+  selector:
+    app: minio
+  ports:
+    - name: api
+      port: 9000
+      targetPort: 9000
+    # Was MinIO's console on 9001. SeaweedFS's equivalent is the filer
+    # browser on 8888, exposed here under the same port number so
+    # anything pointing at 9001 keeps resolving.
+    - name: console
+      port: 9001
+      targetPort: 8888

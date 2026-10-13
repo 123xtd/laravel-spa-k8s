@@ -1,0 +1,57 @@
+# Public route to MinIO itself (not through the app) so uploaded photo
+# URLs (Storage::disk('s3')->url()) actually resolve in a real browser —
+# previously they pointed at MinIO's internal cluster-only hostname,
+# unreachable from outside. Two hostnames since file storage is shared
+# across both regions (no .ca/.com split needed for object storage
+# itself, unlike listings) — either resolves to the same bucket.
+#
+# AWS_URL in laravel-spa-secrets must be set to https://cdn.buyandsellpage.ca
+# (or .com — same backend) for Storage::disk('s3')->url() to actually
+# generate links through this route instead of the internal endpoint.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: minio-public-http
+  namespace: laravel-spa
+spec:
+  entryPoints:
+    - web
+  routes:
+    - match: Host(`cdn.buyandsellpage.ca`) || Host(`cdn.buyandsellpage.com`)
+      kind: Rule
+      services:
+        - name: minio
+          port: 9000
+      middlewares:
+        - name: redirect-to-https
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: minio-public-https
+  namespace: laravel-spa
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`cdn.buyandsellpage.ca`) || Host(`cdn.buyandsellpage.com`)
+      kind: Rule
+      services:
+        - name: minio
+          port: 9000
+  tls:
+    secretName: minio-public-tls
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: minio-public-cert
+  namespace: laravel-spa
+spec:
+  secretName: minio-public-tls
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  dnsNames:
+    - cdn.buyandsellpage.ca
+    - cdn.buyandsellpage.com

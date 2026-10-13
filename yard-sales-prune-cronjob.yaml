@@ -1,0 +1,46 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: yard-sales-prune-ended
+  namespace: laravel-spa
+spec:
+  schedule: "0 3 * * *"
+  # Central Time, not UTC — 3am here is 4am Eastern / 1am Pacific. The
+  # cluster (k8s 1.36) handles CST/CDT automatically, no manual
+  # UTC-offset math.
+  timeZone: "America/Chicago"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+            - name: ghcr-pull-secret
+          containers:
+            - name: prune-ended-yard-sales
+              image: ghcr.io/123xtd/laravel-spa-app:latest
+              command: ["php", "artisan", "yard-sales:prune-ended"]
+              workingDir: /var/www/html
+              envFrom:
+                - secretRef:
+                    name: laravel-spa-secrets
+              securityContext:
+                allowPrivilegeEscalation: false
+                runAsNonRoot: true
+                runAsUser: 82
+                runAsGroup: 82
+                capabilities:
+                  drop: ["ALL"]
+                seccompProfile:
+                  type: RuntimeDefault
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  cpu: 250m
+                  memory: 256Mi
