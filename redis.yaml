@@ -21,6 +21,47 @@ spec:
       containers:
         - name: redis
           image: redis:7-alpine
+          # Declared here rather than set with CONFIG SET at runtime.
+          #
+          # This file had drifted: it still said 250m/256Mi while the live
+          # deployment ran 4 cores/1Gi from a kubectl edit, and the memory
+          # settings lived only in the pod's `args`. Declaring them here
+          # means the manifest is now the whole truth.
+          #
+          # maxmemory is over-provisioned rather than tuned: at the ceiling
+          # (160 arrivals/sec) Redis held 762 MB, of which 739 MB was
+          # per-client I/O buffers for a 640 KB page-cache value served to
+          # 9,160 clients. maxmemory accounting includes those buffers, so
+          # the headroom has to cover them, not just the data -- there were
+          # only 468 actual keys.
+          #
+          # Snapshots are off: a fork at this size transiently doubles RSS,
+          # which is the one thing that could still OOM the pod. Nothing
+          # here needs to survive a restart -- allkeys-lru already discards
+          # sessions under pressure (259,425 keys evicted in one run), so
+          # durability was never a property this store had.
+          command:
+            - redis-server
+            - --maxmemory
+            - "2500mb"
+            - --maxmemory-policy
+            - allkeys-lru
+            - --maxclients
+            - "50000"
+            - --save
+            - ""
+            - --appendonly
+            - "no"
+          # Explicitly empty, and load-bearing.
+          #
+          # Kubernetes appends `args` AFTER `command`, and when two Redis
+          # flags conflict the LAST one wins. A previous kubectl edit had
+          # left args=[--maxclients 20000 --maxmemory 768mb] on this pod,
+          # and because `apply` does not touch fields a manifest omits,
+          # those stale values silently overrode every flag above --
+          # maxmemory read back as 768mb from a pod whose own command line
+          # said otherwise. Declaring it empty is what stops that recurring.
+          args: []
           ports:
             - containerPort: 6379
           securityContext:
@@ -31,13 +72,29 @@ spec:
               drop: ["ALL"]
             seccompProfile:
               type: RuntimeDefault
+          # 2500mb of maxmemory inside a 3.5Gi limit -- 500Mi less than
+          # first set, deliberately.
+          #
+          # Redis is not pinned away from the nodes the load generators
+          # use, even though co-tenancy there is tight. Isolating it would
+          # mean choosing in advance which component fails, and the point
+          # of the exercise is to find out where the next limit actually
+          # is. Giving back 500Mi leaves the busiest node some room
+          # without deciding the outcome.
+          #
+          # Still ~3.3x the 768mb that produced the measured ceiling, so
+          # Redis should be well clear of being the constraint.
+          #
+          # CPU was raised to 4 yesterday when Redis at 0.25 cores was
+          # frozen 22% of wall-clock time. It has never since exceeded
+          # ~150m, so the request is the part that matters.
           resources:
             requests:
-              cpu: 50m
-              memory: 64Mi
+              cpu: 1
+              memory: 1Gi
             limits:
-              cpu: 250m
-              memory: 256Mi
+              cpu: 4
+              memory: 3584Mi
           readinessProbe:
             tcpSocket:
               port: 6379
