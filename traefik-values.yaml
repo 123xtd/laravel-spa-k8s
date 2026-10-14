@@ -35,13 +35,35 @@ deployment:
 # Deliberately not higher: o06 has 0.2 cores free, so a large request
 # would leave a Traefik pod Pending and silently cost the ingress a
 # replica. 1 core lets it reschedule onto k27/icf/u4h/cn9.
+# NOTE on the memory limit, learned the hard way on 2026-10-14.
+#
+# The first version of this block set `limits.memory: 1Gi`. Traefik sits
+# at 110-170Mi idle, so that looked generous. Under the 400-arrivals/sec
+# journey run it OOMKilled all three pods five times each and took the
+# ingress -- and therefore every site -- down mid-test.
+#
+# The error was adding a ceiling that did not previously exist. Traefik
+# had no limits at all, so it could take what it needed; "tightening"
+# that to a number derived from idle usage capped it below its working
+# set. Buffers scale with concurrent connections (there were ~17,000
+# in-flight sessions) and gzip adds a compression buffer per response.
+#
+# So: a request that reserves a real floor, and a limit high enough to be
+# a runaway guard rather than an operating ceiling. If this ever OOMs
+# again the answer is to raise it, not to tune it down.
+# 3Gi, not more: Traefik schedules onto nodes with 7.5Gi allocatable, so
+# a 6Gi ceiling would be 80% of the node and risk kubelet eviction of
+# whatever else lives there -- trading an OOM for a worse failure. 3Gi is
+# triple the value that actually OOMed and under half the smallest host.
+# The next load run samples Traefik's real working set so this can be
+# sized from evidence rather than from both guesses.
 resources:
   requests:
     cpu: "1"
-    memory: "256Mi"
+    memory: "512Mi"
   limits:
     cpu: "4"
-    memory: "1Gi"
+    memory: "3Gi"
 
 additionalArguments:
   # Default is 200: past that, Traefik stops reusing keep-alive
