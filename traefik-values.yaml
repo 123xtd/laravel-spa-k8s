@@ -14,6 +14,35 @@ deployment:
   # ceiling and a single point of failure.
   replicas: 3
 
+# Traefik had NO CPU request or limit at all, which made the ingress
+# carrying 100% of site traffic BestEffort QoS -- the first thing the
+# kernel starves under contention. All three pods also sat on nodes
+# packed with app pods, each of which reserves a guaranteed core.
+#
+# This is the suspected cause of the 2026-10-14 journey run going fully
+# unreachable for five minutes: the app peaked at only 29.5 of 63.8
+# worker cores and its medians stayed healthy (home 319 ms) while p95 sat
+# pinned at the 60s client timeout. Uniform overload slows everything;
+# a starved chokepoint keeps serving some requests fast and queues the
+# rest. The second pattern is what we saw.
+#
+# A request of 1 is not about needing a whole core -- it is about cgroup
+# CPU weight. BestEffort gets 2 shares; 1 core requested gets 1024, so
+# this is a ~500x improvement in what Traefik wins during contention.
+# The limit of 4 leaves headroom for gzip, which it is now also doing
+# (see test-domains.yaml).
+#
+# Deliberately not higher: o06 has 0.2 cores free, so a large request
+# would leave a Traefik pod Pending and silently cost the ingress a
+# replica. 1 core lets it reschedule onto k27/icf/u4h/cn9.
+resources:
+  requests:
+    cpu: "1"
+    memory: "256Mi"
+  limits:
+    cpu: "4"
+    memory: "1Gi"
+
 additionalArguments:
   # Default is 200: past that, Traefik stops reusing keep-alive
   # connections to the backend and opens a fresh one per request, which
