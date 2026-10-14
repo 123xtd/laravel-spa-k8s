@@ -67,6 +67,7 @@ data:
     const ACCOUNT_PASSWORD = __ENV.ACCOUNT_PASSWORD || '';
     const KNOWN_LISTING = __ENV.KNOWN_LISTING || '';
     const PHOTO_KB = parseInt(__ENV.PHOTO_KB || '200', 10);
+    const SUBCATEGORY_REQUESTS = (__ENV.SUBCATEGORY_REQUESTS || 'true') !== 'false';
 
     // Peak arrivals per second across ALL personas. Each scenario takes
     // its share via the weights below, so changing this one number
@@ -137,6 +138,37 @@ data:
     const dur = (mult) => `${n * mult}${unit}`;
     const WRITE_DURATION = __ENV.WRITE_DURATION || '14m';
 
+    // STAIRCASE MODE. The ramp below climbs straight past the ceiling, so
+    // every run ends in a queue and reports the queue rather than the
+    // limit -- runs 2 and 4 both completed 85-116 sessions/sec while being
+    // offered 400/sec, and the excess simply accumulated as latency.
+    //
+    // Set STAIR_STEPS to a comma-separated list of per-generator arrival
+    // rates (multiply by the generator count for site-wide) and each one
+    // is approached and then HELD, so latency has time to settle and each
+    // step can be judged on its own. The highest step whose p95 is still
+    // acceptable is the actual answer to "how many visitors can we take".
+    const STEPS = (__ENV.STAIR_STEPS || '').split(',')
+      .map((v) => parseFloat(v.trim()))
+      .filter((v) => !isNaN(v) && v > 0);
+    const STAIRS = STEPS.length > 0;
+    const STAIR_HOLD = __ENV.STAIR_HOLD || '3m';
+    const STAIR_RAMP = __ENV.STAIR_RAMP || '30s';
+    // VU pre-allocation has to be sized for the TALLEST step, not the
+    // mean: if k6 runs out of VUs it silently stops meeting the target
+    // rate, which looks exactly like the server coping.
+    const CEIL = STAIRS ? Math.max.apply(null, STEPS) : PEAK;
+
+    function stairStages(weight) {
+      const out = [];
+      for (const step of STEPS) {
+        const target = Math.max(1, Math.round(step * weight));
+        out.push({ duration: STAIR_RAMP, target });
+        out.push({ duration: STAIR_HOLD, target });
+      }
+      return out;
+    }
+
     function stages(weight) {
       const at = (f) => Math.max(1, Math.round(PEAK * weight * f));
       return [
@@ -161,9 +193,9 @@ data:
         startRate: 1,
         // Generous headroom: if k6 runs out of VUs it silently stops
         // hitting the target rate, which looks like the server coping.
-        preAllocatedVUs: Math.max(20, Math.round(PEAK * weight * 3)),
-        maxVUs: Math.max(100, Math.round(PEAK * weight * 40)),
-        stages: stages(weight),
+        preAllocatedVUs: Math.max(20, Math.round(CEIL * weight * 3)),
+        maxVUs: Math.max(100, Math.round(CEIL * weight * 40)),
+        stages: STAIRS ? stairStages(weight) : stages(weight),
       };
     }
 
@@ -206,7 +238,14 @@ data:
     };
 
     function headers(extra) {
-      const h = Object.assign({}, extra || {});
+      // Accept-Encoding is set explicitly because k6 does NOT send one.
+      // Probed directly on 2026-10-14: with no header the response came
+      // back with no Content-Encoding, so every earlier run measured
+      // uncompressed traffic and the gzip middleware was never exercised.
+      // k6 decompresses transparently, so the steps that parse a body
+      // (scraping a listing id, a CSRF token) still see plain HTML --
+      // body_len was identical with and without the header.
+      const h = Object.assign({ 'Accept-Encoding': 'gzip' }, extra || {});
       if (BASIC) h.Authorization = BASIC;
       return h;
     }
@@ -287,6 +326,23 @@ data:
       // uncached home page, since CacheGuestPage excludes any request
       // carrying a query string. That is deliberately the "before"
       // number Phase 2 will be compared against.
+      // SUBCATEGORY_REQUESTS=false models what the site does TODAY: a
+      // category click filters the already-loaded cards client-side and
+      // issues no server request at all. The request below was always a
+      // stand-in for a change that has not been built, and it was 27% of
+      // all traffic in earlier runs -- a quarter of the offered load that
+      // production never sees, costing 49 statements a time because a
+      // query string bypasses the page cache.
+      //
+      // Left available because it is still the honest "before" figure for
+      // that change. But a run meant to find the real ceiling must not
+      // include it.
+      // No sleep here on purpose: the caller already does think(6, 0.8)
+      // after this step, which is the time the visitor spends reading the
+      // filtered list. Pausing again would halve the effective load.
+      if (!SUBCATEGORY_REQUESTS) {
+        return null;
+      }
       return step(T.subcategory, 'subcategory', () =>
         get(`/?category=${encodeURIComponent(c)}`));
     }
@@ -573,10 +629,30 @@ spec:
             # Scales the whole timeline. '1m' is the full ~14 minute run;
             # '10s' gives the identical ramp shape in ~2.5 minutes, for
             # verifying the personas work before committing to a long run.
+            # Staircase: per-generator arrival rates, each approached then
+            # HELD so latency settles and every step is judged on its own.
+            # Four generators, so site-wide this is 40/80/120/160/200 per
+            # second. Chosen to straddle the suspected ceiling: runs 2 and
+            # 4 completed 85-116 sessions/sec site-wide.
+            #
+            # Clear STAIR_STEPS to fall back to the original ramp.
+            - name: STAIR_STEPS
+              value: "10,20,30,40,50"
+            - name: STAIR_HOLD
+              value: "3m"
+            - name: STAIR_RAMP
+              value: "30s"
+            # Zero server requests per category click, which is what the
+            # site actually does today. See viewSubcategory().
+            - name: SUBCATEGORY_REQUESTS
+              value: "false"
             - name: RAMP_UNIT
               value: "1m"
+            # Must span the whole staircase (5 steps x 3m30s = 17m30s),
+            # or the write personas stop partway and the taller steps get
+            # measured without them.
             - name: WRITE_DURATION
-              value: "14m"
+              value: "18m"
             - name: ACCOUNT_COUNT
               value: "200"
             - name: ACCOUNT_PASSWORD
