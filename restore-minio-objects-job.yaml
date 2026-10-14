@@ -1,0 +1,93 @@
+# One-shot recovery of the objects MinIO wrote, into SeaweedFS.
+#
+# Why this is needed: SeaweedFS replaced MinIO on 2026-10-13 (MinIO
+# relicensed and moved features behind a paid tier). It reuses the SAME
+# PersistentVolumeClaim, deliberately storing its own data under
+# /data/seaweedfs so it would not overwrite MinIO's files -- which is why
+# nothing was lost. But the new S3 gateway only serves what is under its
+# own directory, so every object written before the swap became
+# unreachable through Storage::disk() even though it is still on disk.
+#
+# Measured effect before this ran: of 1,154 listing-image files recorded
+# in the database, 1,044 resolved and 110 did not. The 110 were exactly
+# the files uploaded before the swap.
+#
+#   created       present  missing
+#   2026-09-24          0       90
+#   2026-10-11          0       20
+#   2026-10-13        376        0   <- SeaweedFS deployed 20:09 this day
+#   2026-10-14        702        0
+#
+# MinIO's on-disk layout: each object key is a DIRECTORY containing
+# xl.meta. Small objects (under ~128 KB) are inlined into xl.meta itself;
+# larger ones keep their bytes in <uuid>/part.1. Both cases are handled
+# below. For the inlined case the payload is located by its own magic
+# bytes rather than a fixed offset, because the metadata preceding it
+# varies in length.
+#
+# Purely additive: it only writes keys that are currently absent, and
+# skips any that already resolve. Safe to re-run.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: restore-minio-objects
+  namespace: laravel-spa
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: ghcr-pull-secret
+      securityContext:
+        fsGroup: 1000
+      # Must land on whichever node already has the volume attached.
+      #
+      # minio-data is ReadWriteOnce on Longhorn, so it attaches to ONE
+      # node at a time -- and the storage pod holds it. ReadWriteOnce
+      # means one node, not one pod, so co-locating with that pod works
+      # while scheduling anywhere else fails with "Multi-Attach error for
+      # volume ... already used by pod(s) minio-...".
+      #
+      # If the storage pod ever moves, update this to match it:
+      #   kubectl get pods -n laravel-spa -l app=minio \
+      #     -o jsonpath='{.items[0].spec.nodeName}'
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - talos-o06-xjv
+      containers:
+        - name: restore
+          image: ghcr.io/123xtd/laravel-spa-app:latest
+          command: ["php", "artisan", "tinker", "--execute", "require '/scripts/restore.php';"]
+          envFrom:
+            - secretRef:
+                name: laravel-spa-secrets
+          volumeMounts:
+            - name: legacy-data
+              mountPath: /legacy
+              readOnly: true
+            - name: script
+              mountPath: /scripts
+          # Small request on purpose: the node this is pinned to has only
+          # ~0.3 cores unreserved, and a request it cannot satisfy leaves
+          # the job Pending forever rather than failing visibly.
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+      volumes:
+        - name: legacy-data
+          persistentVolumeClaim:
+            claimName: minio-data
+        - name: script
+          configMap:
+            name: restore-minio-script
