@@ -506,6 +506,18 @@ spec:
         app: k6-journey
     spec:
       restartPolicy: Never
+      # Only five of the eight nodes can run a generator at all: the other
+      # three are control planes, tainted NoSchedule, which is why they
+      # look invitingly idle in `kubectl top` and are not. Of the five,
+      # o06 and cn9 have under 1.5 cores free, so the request below would
+      # leave a generator Pending there.
+      #
+      # icf is listed first on purpose -- it carries no app pods, so a
+      # generator there competes with nothing. k27 and u4h between them
+      # host 21 of the 24 pods under test, so a generator landing on one
+      # is taking CPU from the thing being measured. That understates
+      # capacity rather than overstating it, but it is worth avoiding
+      # where there is a choice, hence the spread constraint below.
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -514,8 +526,20 @@ spec:
                   - key: kubernetes.io/hostname
                     operator: In
                     values:
+                      - talos-icf-5wi
                       - talos-k27-emb
                       - talos-u4h-61d
+      # Without this the scheduler is free to put all four generators on
+      # k27, since it has the most free CPU -- which is also where 14 of
+      # the pods under test live. Spreading them means at most two share
+      # a node.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: k6-journey
       containers:
         - name: k6
           image: grafana/k6:latest
@@ -573,8 +597,13 @@ spec:
             requests:
               cpu: "3"
               memory: "2Gi"
+            # Limit cut from 8 to 6: four generators bursting to 8 is 32
+            # cores, and the only node with room for several of them has
+            # 31.9 in total and 14 app pods on it. The generator would win
+            # that fight and we would be measuring a CPU-starved app.
+            # Three cores is the guaranteed floor either way.
             limits:
-              cpu: "8"
+              cpu: "6"
               memory: "6Gi"
       volumes:
         - name: script
