@@ -7,6 +7,30 @@ spec:
   basicAuth:
     secret: laravel-spa-test-domains-auth
 ---
+# Response compression, currently on the A/B clone only.
+#
+# Nothing was compressing anything: measured 2026-10-14, a request to
+# www.foasfo.ca carrying `Accept-Encoding: gzip, br` came back as 278,402
+# bytes with no Content-Encoding header at all. The home page is 174 KB of
+# JSON which Inertia then entity-escapes into the HTML (every `"` becomes
+# `&quot;`), and JSON that repetitive compresses roughly 7-8x.
+#
+# It mattered: the 400-arrivals/sec journey run moved 78 MB/s -- 624 Mbps
+# -- of response bodies, which is a real fraction of a gigabit link, and
+# the payload grows as listings accumulate (browseListings is capped at
+# 200 entries and was only at 71).
+#
+# minResponseBodyBytes is left at the default 1024, so small JSON replies
+# (the deferred personal "bag" is ~3 KB) still compress, but tiny ones do
+# not pay the CPU for nothing.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: compress
+  namespace: laravel-spa
+spec:
+  compress: {}
+---
 apiVersion: traefik.io/v1alpha1
 kind: IngressRoute
 metadata:
@@ -53,8 +77,17 @@ spec:
       services:
         - name: laravel-spa-app-clone
           port: 80
+      # Order matters: auth is listed first so it sees the request first
+      # and rejects an unauthorised one before anything else runs. The
+      # response then flows back out through compress, which is what
+      # actually compresses the app's output -- and this way a 401 body
+      # is not compressed for nothing.
+      #
+      # Only this route has compress, so the real site stays uncompressed
+      # and the A/B comparison still means something.
       middlewares:
         - name: laravel-spa-test-domains-auth
+        - name: compress
     - match: Host(`www.ba-sp.com`) || Host(`www.foasfo.com`)
       kind: Rule
       services:
