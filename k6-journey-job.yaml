@@ -193,8 +193,26 @@ data:
         startRate: 1,
         // Generous headroom: if k6 runs out of VUs it silently stops
         // hitting the target rate, which looks like the server coping.
-        preAllocatedVUs: Math.max(20, Math.round(CEIL * weight * 3)),
-        maxVUs: Math.max(100, Math.round(CEIL * weight * 40)),
+        // Sizing these is a memory problem, not a guess.
+        //
+        // The three read weights sum to 1.0, so total maxVUs across the
+        // scenarios is CEIL x multiplier. A k6 VU measured at 2.12 MB in
+        // the staircase run (2.9 GB at 1,366 VUs), so the multiplier is
+        // bounded by the generator's memory limit:
+        //
+        //   CEIL=50  mult=40  ->  2,000 VUs =  4.1 GB   (what ran)
+        //   CEIL=50  mult=50  ->  2,500 VUs =  5.2 GB   OOMs a 6Gi limit
+        //   CEIL=100 mult=45  ->  4,500 VUs =  9.5 GB   needs ~11Gi
+        //
+        // Sessions average ~30s, so each sustained arrival/sec needs ~30
+        // concurrent VUs. 40 was barely above that minimum, which is why
+        // the run peaked at 96% of its VU ceiling and dropped 9.5% of
+        // scheduled sessions -- the generator running dry, not the site
+        // refusing work. 45 gives 50% headroom over the minimum; going
+        // higher requires raising the memory limit in step, or the
+        // generator dies instead of the site.
+        preAllocatedVUs: Math.max(20, Math.round(CEIL * weight * 8)),
+        maxVUs: Math.max(100, Math.round(CEIL * weight * 45)),
         stages: STAIRS ? stairStages(weight) : stages(weight),
       };
     }
