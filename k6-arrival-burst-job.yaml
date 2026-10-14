@@ -1,0 +1,201 @@
+# Arrival-burst test: how many brand-new visitors can land AT ONCE?
+#
+# WHY THIS EXISTS ALONGSIDE k6-journey-job.yaml
+#
+# The journey test models steady state. At any instant its users are
+# scattered across home, subcategories, listings, detail and search, each
+# costing something different -- load is spread by construction.
+#
+# The worst case is the opposite. Ten thousand people arriving together
+# have all done exactly one thing, and it is the same thing: load the
+# entry page. No dispersion. Maximum contention on a single path.
+# Everything after that first page is easier, because they fan out.
+#
+# It also happens to aim straight at the known constraint. A new arrival
+# is a GUEST, and the guest home page is fully page-cached -- zero
+# database queries. So a burst does not touch the database at all. What it
+# hammers is a 444 KB page pulled from Redis into a per-client buffer and
+# pushed out through Traefik, which is exactly what produced the measured
+# ceiling (762 MB of Redis memory, 97% of it client buffers).
+#
+# METHOD: ascend until it breaks, then walk back.
+#
+# `per-vu-iterations` with one iteration per VU means the arrivals are
+# genuinely simultaneous rather than a sustained rate -- a thundering
+# herd, not a ramp. Each VU is a fresh visitor with its own cookie jar.
+#
+# This first pass climbs hard (2k -> 40k) to find the bracket where it
+# fails. A second pass then bisects between the last clean burst and the
+# first broken one, which is the number we actually want.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-arrival-burst-script
+  namespace: laravel-spa
+data:
+  burst.js: |
+    import http from 'k6/http';
+    import { Trend, Rate, Counter } from 'k6/metrics';
+    import { b64encode } from 'k6/encoding';
+
+    const HOST = __ENV.TARGET_HOST || 'www.foasfo.ca';
+    const BASE = `https://${HOST}`;
+    const AUTH = __ENV.AUTH || '';
+    const BASIC = AUTH ? 'Basic ' + b64encode(AUTH) : null;
+
+    // Per-generator VU counts. Multiply by the generator count for the
+    // site-wide burst size. Overridable so the second pass can bisect
+    // without editing the script.
+    const SIZES = (__ENV.BURST_SIZES || '250,625,1250,2500,5000')
+      .split(',').map((v) => parseInt(v.trim(), 10)).filter((v) => v > 0);
+    // Gap between bursts. Long enough for connections to close, buffers
+    // to drain and the page cache to be re-read, so each burst starts
+    // from a comparable state rather than inheriting the last one's mess.
+    const GAP = parseInt(__ENV.BURST_GAP || '90', 10);
+
+    const GENS = parseInt(__ENV.GENERATORS || '8', 10);
+
+    // One metric set per burst, because an aggregate across bursts is
+    // exactly the thing that hides the breaking point.
+    const M = SIZES.map((vus, i) => ({
+      vus,
+      label: `b${i + 1}_${vus * GENS}`,
+      latency: new Trend(`burst_${i + 1}_${vus * GENS}_ms`, true),
+      ok: new Rate(`burst_${i + 1}_${vus * GENS}_ok`),
+      fails: new Counter(`burst_${i + 1}_${vus * GENS}_failed`),
+    }));
+
+    function arrive(idx) {
+      const m = M[idx];
+      const res = http.get(`${BASE}/`, {
+        headers: Object.assign(
+          { 'Accept-Encoding': 'gzip' },
+          BASIC ? { Authorization: BASIC } : {}
+        ),
+        // A new visitor's browser would parse this, but holding 444 KB
+        // per VU across 5,000 VUs would make the generator the story.
+        responseType: 'none',
+        timeout: '60s',
+      });
+      m.latency.add(res.timings.duration);
+      const good = res.status === 200;
+      m.ok.add(good);
+      if (!good) m.fails.add(1);
+    }
+
+    export function burst1() { arrive(0); }
+    export function burst2() { arrive(1); }
+    export function burst3() { arrive(2); }
+    export function burst4() { arrive(3); }
+    export function burst5() { arrive(4); }
+
+    const scenarios = {};
+    SIZES.forEach((vus, i) => {
+      scenarios[`burst${i + 1}`] = {
+        executor: 'per-vu-iterations',
+        exec: `burst${i + 1}`,
+        vus,
+        iterations: 1,
+        startTime: `${i * GAP}s`,
+        // Generous: a burst that takes longer than this to drain has
+        // already failed, and cutting it short would hide how badly.
+        maxDuration: `${GAP - 15}s`,
+        gracefulStop: '10s',
+      };
+    });
+
+    export const options = {
+      hosts: { [HOST]: __ENV.LB_IP || '192.168.100.200' },
+      scenarios,
+      discardResponseBodies: true,
+      // Reported, not enforced -- the run must complete every burst so
+      // the whole curve is visible, including the broken end of it.
+      thresholds: {
+        http_req_failed: ['rate<0.01'],
+      },
+    };
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: k6-arrival-burst
+  namespace: laravel-spa
+spec:
+  parallelism: 8
+  completions: 8
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: k6-arrival-burst
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - talos-cn9-j91
+                      - talos-icf-5wi
+                      - talos-o06-xjv
+                      - talos-k27-emb
+                      - talos-u4h-61d
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: k6-arrival-burst
+      containers:
+        - name: k6
+          image: grafana/k6:latest
+          args: ["run", "/scripts/burst.js"]
+          env:
+            - name: TARGET_HOST
+              value: "www.foasfo.ca"
+            - name: LB_IP
+              value: "192.168.100.200"
+            - name: GENERATORS
+              value: "8"
+            - name: AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: loadtest-credentials
+                  key: BASIC_AUTH
+            # Per generator; x8 for site-wide. 2k / 5k / 10k / 20k / 40k
+            # simultaneous arrivals. Deliberately climbs past where it is
+            # expected to break.
+            - name: BURST_SIZES
+              value: "250,625,1250,2500,5000"
+            - name: BURST_GAP
+              value: "90"
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+          # No requests, no limits -- by policy.
+          #
+          # A request RESERVES capacity whether or not it is used, and the
+          # scheduler places pods on reservations rather than reality. That is
+          # what made this cluster look 79% full while it was 35% used, so
+          # nothing could be placed and "least loaded node" was decided from
+          # fiction. A limit is a ceiling that has to be guessed in advance,
+          # and every guess made here was wrong for the next traffic shape --
+          # it OOMKilled the ingress twice.
+          #
+          # So: nothing is reserved and nothing is capped. Every pod may take
+          # whatever the node has free, and scaling decisions belong to
+          # Kubernetes (see the HorizontalPodAutoscalers) rather than to
+          # hand-picked numbers.
+          #
+          # The accepted trade-off: with no requests every pod is BestEffort
+          # QoS, so under genuine node memory pressure the kubelet evicts
+          # these first and the kernel may OOM-kill them. That is deliberate.
+      volumes:
+        - name: script
+          configMap:
+            name: k6-arrival-burst-script

@@ -43,7 +43,7 @@ spec:
           command:
             - redis-server
             - --maxmemory
-            - "2500mb"
+            - "8gb"
             - --maxmemory-policy
             - allkeys-lru
             - --maxclients
@@ -72,29 +72,24 @@ spec:
               drop: ["ALL"]
             seccompProfile:
               type: RuntimeDefault
-          # 2500mb of maxmemory inside a 3.5Gi limit -- 500Mi less than
-          # first set, deliberately.
+          # No requests, no limits -- by policy.
           #
-          # Redis is not pinned away from the nodes the load generators
-          # use, even though co-tenancy there is tight. Isolating it would
-          # mean choosing in advance which component fails, and the point
-          # of the exercise is to find out where the next limit actually
-          # is. Giving back 500Mi leaves the busiest node some room
-          # without deciding the outcome.
+          # A request RESERVES capacity whether or not it is used, and the
+          # scheduler places pods on reservations rather than reality. That is
+          # what made this cluster look 79% full while it was 35% used, so
+          # nothing could be placed and "least loaded node" was decided from
+          # fiction. A limit is a ceiling that has to be guessed in advance,
+          # and every guess made here was wrong for the next traffic shape --
+          # it OOMKilled the ingress twice.
           #
-          # Still ~3.3x the 768mb that produced the measured ceiling, so
-          # Redis should be well clear of being the constraint.
+          # So: nothing is reserved and nothing is capped. Every pod may take
+          # whatever the node has free, and scaling decisions belong to
+          # Kubernetes (see the HorizontalPodAutoscalers) rather than to
+          # hand-picked numbers.
           #
-          # CPU was raised to 4 yesterday when Redis at 0.25 cores was
-          # frozen 22% of wall-clock time. It has never since exceeded
-          # ~150m, so the request is the part that matters.
-          resources:
-            requests:
-              cpu: 1
-              memory: 1Gi
-            limits:
-              cpu: 4
-              memory: 3584Mi
+          # The accepted trade-off: with no requests every pod is BestEffort
+          # QoS, so under genuine node memory pressure the kubelet evicts
+          # these first and the kernel may OOM-kill them. That is deliberate.
           readinessProbe:
             tcpSocket:
               port: 6379

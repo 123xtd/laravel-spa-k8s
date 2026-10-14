@@ -164,9 +164,24 @@ metadata:
 spec:
   accessModes: ["ReadWriteOnce"]
   storageClassName: longhorn
-  resources:
-    requests:
-      storage: 2Gi
+  # No requests, no limits -- by policy.
+  #
+  # A request RESERVES capacity whether or not it is used, and the
+  # scheduler places pods on reservations rather than reality. That is
+  # what made this cluster look 79% full while it was 35% used, so
+  # nothing could be placed and "least loaded node" was decided from
+  # fiction. A limit is a ceiling that has to be guessed in advance,
+  # and every guess made here was wrong for the next traffic shape --
+  # it OOMKilled the ingress twice.
+  #
+  # So: nothing is reserved and nothing is capped. Every pod may take
+  # whatever the node has free, and scaling decisions belong to
+  # Kubernetes (see the HorizontalPodAutoscalers) rather than to
+  # hand-picked numbers.
+  #
+  # The accepted trade-off: with no requests every pod is BestEffort
+  # QoS, so under genuine node memory pressure the kubelet evicts
+  # these first and the kernel may OOM-kill them. That is deliberate.
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -222,12 +237,24 @@ spec:
               mountPath: /etc/grafana/dashboards
             - name: data
               mountPath: /var/lib/grafana
-          resources:
-            requests:
-              cpu: "100m"
-              memory: "256Mi"
-            limits:
-              memory: "1Gi"
+          # No requests, no limits -- by policy.
+          #
+          # A request RESERVES capacity whether or not it is used, and the
+          # scheduler places pods on reservations rather than reality. That is
+          # what made this cluster look 79% full while it was 35% used, so
+          # nothing could be placed and "least loaded node" was decided from
+          # fiction. A limit is a ceiling that has to be guessed in advance,
+          # and every guess made here was wrong for the next traffic shape --
+          # it OOMKilled the ingress twice.
+          #
+          # So: nothing is reserved and nothing is capped. Every pod may take
+          # whatever the node has free, and scaling decisions belong to
+          # Kubernetes (see the HorizontalPodAutoscalers) rather than to
+          # hand-picked numbers.
+          #
+          # The accepted trade-off: with no requests every pod is BestEffort
+          # QoS, so under genuine node memory pressure the kubelet evicts
+          # these first and the kernel may OOM-kill them. That is deliberate.
       volumes:
         - name: datasources
           configMap:

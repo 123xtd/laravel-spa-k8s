@@ -40,6 +40,10 @@ metadata:
 spec:
   # Matches the real tier exactly. If one side has more capacity than
   # the other, the comparison measures the replica count, not the change.
+  # The HPA owns this once it exists (see the HorizontalPodAutoscaler at
+  # the end of this file), so this value only applies before the HPA's
+  # first reconcile. Kept at the old fixed count so a fresh apply does
+  # not start the site at the floor.
   replicas: 24
   selector:
     matchLabels:
@@ -133,13 +137,24 @@ spec:
               drop: ["ALL"]
             seccompProfile:
               type: RuntimeDefault
-          resources:
-            requests:
-              cpu: 1000m
-              memory: 768Mi
-            limits:
-              cpu: "6"
-              memory: 2Gi
+          # No requests, no limits -- by policy.
+          #
+          # A request RESERVES capacity whether or not it is used, and the
+          # scheduler places pods on reservations rather than reality. That is
+          # what made this cluster look 79% full while it was 35% used, so
+          # nothing could be placed and "least loaded node" was decided from
+          # fiction. A limit is a ceiling that has to be guessed in advance,
+          # and every guess made here was wrong for the next traffic shape --
+          # it OOMKilled the ingress twice.
+          #
+          # So: nothing is reserved and nothing is capped. Every pod may take
+          # whatever the node has free, and scaling decisions belong to
+          # Kubernetes (see the HorizontalPodAutoscalers) rather than to
+          # hand-picked numbers.
+          #
+          # The accepted trade-off: with no requests every pod is BestEffort
+          # QoS, so under genuine node memory pressure the kubelet evicts
+          # these first and the kernel may OOM-kill them. That is deliberate.
           readinessProbe:
             httpGet:
               path: /healthz
@@ -162,3 +177,77 @@ spec:
   ports:
     - port: 80
       targetPort: 8080
+---
+# Scale the app tier on demand, so a traffic spike is absorbed without
+# anyone watching.
+#
+# WHY CPU IS THE TRIGGER
+# HPA measures utilisation against the REQUEST, not the limit. The
+# request is 400m and a pod under load draws ~540m, so load shows up as
+# ~135% utilisation and this fires decisively. That is also why the
+# request is deliberately below peak usage: a request sized to guarantee
+# peak would read as 100% utilisation at full load and never scale.
+#
+# WHAT THIS CANNOT DO
+# A pod takes tens of seconds to start and warm. This absorbs SUSTAINED
+# load -- a busy evening, a traffic ramp -- but it cannot react to an
+# instantaneous burst. Measured 2026-10-14: 2,000 simultaneous arrivals
+# drain in ~5 seconds, which is over before a new pod is ready. Bursts
+# are absorbed by the page cache and by headroom in the running pods,
+# not by this. Horizontal scaling is not a substitute for the floor
+# being high enough.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: laravel-spa-app-clone
+  namespace: laravel-spa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: laravel-spa-app-clone
+  # Floor of 8 rather than 1: the floor is what meets a burst before any
+  # scaling can happen, and an idle pod costs ~50m. Ceiling of 40 is
+  # bounded by requests -- 40 x 400m is 16 of 63.8 usable worker cores,
+  # leaving room for the ingress and the load generators.
+  minReplicas: 8
+  maxReplicas: 40
+  # AverageValue, not Utilization.
+  #
+  # Utilization is a percentage OF THE REQUEST, so with no requests set
+  # it has nothing to divide by and the HPA reports <unknown> forever
+  # and never scales. An absolute target needs no reservation: scale out
+  # whenever the average pod is burning more than half a core.
+  #
+  # 500m was measured -- pods drew ~540m each under a 400-arrivals/sec
+  # run -- so this fires at roughly the load that preceded trouble,
+  # rather than at an arbitrary fraction of a number nobody reserved.
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: AverageValue
+          averageValue: 500m
+  behavior:
+    # Asymmetric on purpose. Scaling up late costs users their page;
+    # scaling down late costs a few idle pods. So: react immediately and
+    # aggressively upward, and retreat slowly.
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+        - type: Pods
+          value: 8
+          periodSeconds: 15
+      selectPolicy: Max
+    scaleDown:
+      # Five minutes of calm before giving anything back, so a lull
+      # between spikes does not strip the capacity the next one needs.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 25
+          periodSeconds: 60

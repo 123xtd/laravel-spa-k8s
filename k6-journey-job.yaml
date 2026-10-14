@@ -206,13 +206,20 @@ data:
         //
         // Sessions average ~30s, so each sustained arrival/sec needs ~30
         // concurrent VUs. 40 was barely above that minimum, which is why
-        // the run peaked at 96% of its VU ceiling and dropped 9.5% of
-        // scheduled sessions -- the generator running dry, not the site
-        // refusing work. 45 gives 50% headroom over the minimum; going
-        // higher requires raising the memory limit in step, or the
-        // generator dies instead of the site.
+        // an early run peaked at 96% of its VU ceiling.
+        //
+        // 36 (20% headroom) rather than 45, because of what the ceiling
+        // question actually requires. PAST the knee, VU demand is
+        // unbounded: the site slows, sessions stop completing, and the
+        // generator needs ever more VUs to sustain the same arrival rate.
+        // No allocation survives that. What matters is that the
+        // generators are healthy up to and including the last GOOD step,
+        // where sessions do complete in ~30s and demand is predictable.
+        // Spending memory on surviving past the breaking point buys
+        // nothing and costs reach -- 36 instead of 45 is 25% more
+        // arrivals from the same RAM.
         preAllocatedVUs: Math.max(20, Math.round(CEIL * weight * 8)),
-        maxVUs: Math.max(100, Math.round(CEIL * weight * 45)),
+        maxVUs: Math.max(100, Math.round(CEIL * weight * 36)),
         stages: STAIRS ? stairStages(weight) : stages(weight),
       };
     }
@@ -571,8 +578,8 @@ metadata:
   name: k6-journey
   namespace: laravel-spa
 spec:
-  parallelism: 4
-  completions: 4
+  parallelism: 8
+  completions: 8
   backoffLimit: 0
   template:
     metadata:
@@ -600,11 +607,21 @@ spec:
                   - key: kubernetes.io/hostname
                     operator: In
                     values:
-                      # icf is deliberately dropped now that generators
-                      # need ~7 GB: it has 7.5Gi allocatable in total and
-                      # also hosts a Traefik pod, so a generator there
-                      # would be the next thing to OOM. k27 (32Gi) takes
-                      # three and u4h (15.5Gi) takes one.
+                      # All five worker nodes, which is the point of
+                      # running eight smaller generators instead of four
+                      # large ones. Only k27 (32Gi) and u4h (15.5Gi) could
+                      # host a 9Gi generator, and that -- not the cluster's
+                      # total memory -- was what capped load generation.
+                      # The other three have ~5.2Gi free each, plenty for
+                      # a 4Gi generator, so splitting the same total VU
+                      # budget into smaller pieces reaches 49Gi of free
+                      # memory instead of 33Gi.
+                      #
+                      # The other three nodes are control planes, tainted
+                      # NoSchedule, and are not available at all.
+                      - talos-cn9-j91
+                      - talos-icf-5wi
+                      - talos-o06-xjv
                       - talos-k27-emb
                       - talos-u4h-61d
       # Without this the scheduler is free to put all four generators on
@@ -638,6 +655,20 @@ spec:
             # old VUS_PER_POD numbers.
             - name: PEAK_ARRIVALS
               value: "100"
+            # Halved because the generator count doubled. These are
+            # per-generator ABSOLUTE rates, not a share of arrivals, so
+            # going from four generators to eight would otherwise double
+            # the site-wide write load and change what the test measures.
+            # Site-wide these stay at 8/s saves, 4/s enquiries, ~1 ad
+            # every 3s, ~1 yard sale every 12s.
+            - name: RATE_SAVER
+              value: "1"
+            - name: RATE_ENQUIRER
+              value: "0.5"
+            - name: RATE_POSTER
+              value: "0.04"
+            - name: RATE_YARDSALER
+              value: "0.01"
             - name: RECAPTCHA_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -658,8 +689,13 @@ spec:
             # 4 completed 85-116 sessions/sec site-wide.
             #
             # Clear STAIR_STEPS to fall back to the original ramp.
+            # Per-generator; EIGHT generators now, so site-wide this is
+            # 160/200/256/320/400 per second. The first two levels repeat
+            # the known-good result (160 clean, 200 clean after Redis was
+            # lifted) so each run re-validates its own baseline before
+            # pushing into new territory.
             - name: STAIR_STEPS
-              value: "40,50,60,70,75"
+              value: "20,25,32,40,50"
             - name: STAIR_HOLD
               value: "3m"
             - name: STAIR_RAMP
@@ -687,28 +723,24 @@ spec:
           volumeMounts:
             - name: script
               mountPath: /scripts
-          resources:
-            # A starved generator under-drives the test and looks like
-            # success -- the worst failure mode. Two of four generators
-            # failed to schedule on the 16k run and produced half-load
-            # data that had to be thrown away.
-            # Measured in the staircase run: each generator used 0.4 cores
-            # and 2.9 GB at 200 arrivals/sec site-wide. So these are
-            # memory-hungry and CPU-light, and the earlier 3-core request
-            # was reserving CPU they never touch while the 6Gi limit was
-            # capping the thing they actually need.
-            #
-            # At 75 arrivals/sec each (300 site-wide) the VU budget is
-            # 75 x 45 = 3,375 VUs x 2.12 MB = ~7.2 GB, so 9Gi is the
-            # limit that has to hold -- and the reason this cannot simply
-            # be set to 150/sec: that would want 14 GB per generator and
-            # no node can host several of those beside the app.
-            requests:
-              cpu: "2"
-              memory: "3Gi"
-            limits:
-              cpu: "6"
-              memory: "9Gi"
+          # No requests, no limits -- by policy.
+          #
+          # A request RESERVES capacity whether or not it is used, and the
+          # scheduler places pods on reservations rather than reality. That is
+          # what made this cluster look 79% full while it was 35% used, so
+          # nothing could be placed and "least loaded node" was decided from
+          # fiction. A limit is a ceiling that has to be guessed in advance,
+          # and every guess made here was wrong for the next traffic shape --
+          # it OOMKilled the ingress twice.
+          #
+          # So: nothing is reserved and nothing is capped. Every pod may take
+          # whatever the node has free, and scaling decisions belong to
+          # Kubernetes (see the HorizontalPodAutoscalers) rather than to
+          # hand-picked numbers.
+          #
+          # The accepted trade-off: with no requests every pod is BestEffort
+          # QoS, so under genuine node memory pressure the kubelet evicts
+          # these first and the kernel may OOM-kill them. That is deliberate.
       volumes:
         - name: script
           configMap:

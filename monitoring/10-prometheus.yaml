@@ -205,12 +205,24 @@ metadata:
 spec:
   accessModes: ["ReadWriteOnce"]
   storageClassName: longhorn
-  resources:
-    requests:
-      # 15 days at 15s intervals for a cluster this size fits well
-      # inside this. Longhorn's pool is small, so this is deliberately
-      # modest -- raise it if retention needs extending.
-      storage: 10Gi
+  # No requests, no limits -- by policy.
+  #
+  # A request RESERVES capacity whether or not it is used, and the
+  # scheduler places pods on reservations rather than reality. That is
+  # what made this cluster look 79% full while it was 35% used, so
+  # nothing could be placed and "least loaded node" was decided from
+  # fiction. A limit is a ceiling that has to be guessed in advance,
+  # and every guess made here was wrong for the next traffic shape --
+  # it OOMKilled the ingress twice.
+  #
+  # So: nothing is reserved and nothing is capped. Every pod may take
+  # whatever the node has free, and scaling decisions belong to
+  # Kubernetes (see the HorizontalPodAutoscalers) rather than to
+  # hand-picked numbers.
+  #
+  # The accepted trade-off: with no requests every pod is BestEffort
+  # QoS, so under genuine node memory pressure the kubelet evicts
+  # these first and the kernel may OOM-kill them. That is deliberate.
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -254,17 +266,24 @@ spec:
               mountPath: /etc/prometheus
             - name: data
               mountPath: /prometheus
-          resources:
-            requests:
-              cpu: "200m"
-              memory: "512Mi"
-            limits:
-              # Deliberately no CPU limit. Throttling a monitoring pod
-              # is how you lose visibility exactly when you need it --
-              # which is the whole lesson of 2026-10-13. Memory is
-              # capped because that protects the node; CPU is
-              # compressible and does not need to be.
-              memory: "2Gi"
+          # No requests, no limits -- by policy.
+          #
+          # A request RESERVES capacity whether or not it is used, and the
+          # scheduler places pods on reservations rather than reality. That is
+          # what made this cluster look 79% full while it was 35% used, so
+          # nothing could be placed and "least loaded node" was decided from
+          # fiction. A limit is a ceiling that has to be guessed in advance,
+          # and every guess made here was wrong for the next traffic shape --
+          # it OOMKilled the ingress twice.
+          #
+          # So: nothing is reserved and nothing is capped. Every pod may take
+          # whatever the node has free, and scaling decisions belong to
+          # Kubernetes (see the HorizontalPodAutoscalers) rather than to
+          # hand-picked numbers.
+          #
+          # The accepted trade-off: with no requests every pod is BestEffort
+          # QoS, so under genuine node memory pressure the kubelet evicts
+          # these first and the kernel may OOM-kill them. That is deliberate.
       volumes:
         - name: config
           configMap:

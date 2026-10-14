@@ -59,13 +59,24 @@ spec:
                   drop: ["ALL"]
                 seccompProfile:
                   type: RuntimeDefault
-              resources:
-                requests:
-                  cpu: 100m
-                  memory: 256Mi
-                limits:
-                  cpu: 500m
-                  memory: 512Mi
+              # No requests, no limits -- by policy.
+              #
+              # A request RESERVES capacity whether or not it is used, and the
+              # scheduler places pods on reservations rather than reality. That is
+              # what made this cluster look 79% full while it was 35% used, so
+              # nothing could be placed and "least loaded node" was decided from
+              # fiction. A limit is a ceiling that has to be guessed in advance,
+              # and every guess made here was wrong for the next traffic shape --
+              # it OOMKilled the ingress twice.
+              #
+              # So: nothing is reserved and nothing is capped. Every pod may take
+              # whatever the node has free, and scaling decisions belong to
+              # Kubernetes (see the HorizontalPodAutoscalers) rather than to
+              # hand-picked numbers.
+              #
+              # The accepted trade-off: with no requests every pod is BestEffort
+              # QoS, so under genuine node memory pressure the kubelet evicts
+              # these first and the kernel may OOM-kill them. That is deliberate.
           containers:
             - name: upload
               image: ghcr.io/123xtd/laravel-spa-app:latest
@@ -86,10 +97,21 @@ spec:
                   drop: ["ALL"]
                 seccompProfile:
                   type: RuntimeDefault
-              resources:
-                requests:
-                  cpu: 50m
-                  memory: 128Mi
-                limits:
-                  cpu: 250m
-                  memory: 256Mi
+              # No requests, no limits -- by policy.
+              #
+              # A request RESERVES capacity whether or not it is used, and the
+              # scheduler places pods on reservations rather than reality. That is
+              # what made this cluster look 79% full while it was 35% used, so
+              # nothing could be placed and "least loaded node" was decided from
+              # fiction. A limit is a ceiling that has to be guessed in advance,
+              # and every guess made here was wrong for the next traffic shape --
+              # it OOMKilled the ingress twice.
+              #
+              # So: nothing is reserved and nothing is capped. Every pod may take
+              # whatever the node has free, and scaling decisions belong to
+              # Kubernetes (see the HorizontalPodAutoscalers) rather than to
+              # hand-picked numbers.
+              #
+              # The accepted trade-off: with no requests every pod is BestEffort
+              # QoS, so under genuine node memory pressure the kubelet evicts
+              # these first and the kernel may OOM-kill them. That is deliberate.

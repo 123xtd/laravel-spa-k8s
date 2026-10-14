@@ -1,69 +1,73 @@
 # Helm values for the Traefik release (chart traefik-41.3.0, namespace
-# traefik-system). The release was installed 2026-08-24 with no values at
-# all, i.e. pure chart defaults — this file is the first customisation, so
-# keep it as the single source of truth and apply changes with:
+# traefik-system). Apply with:
 #
 #   helm upgrade traefik traefik/traefik -n traefik-system \
 #     --version 41.3.0 -f k8s/traefik-values.yaml
 #
-# Anything set via `kubectl scale`/`kubectl edit` instead will be silently
+# Anything set via `kubectl scale`/`kubectl edit` instead is silently
 # reverted by the next helm upgrade.
+#
+# ---------------------------------------------------------------------
+# NO REQUESTS, NO LIMITS -- by policy.
+#
+# A REQUEST is a reservation: it is guaranteed, it decides scheduling,
+# and it sets the pod's cgroup CPU weight. A LIMIT is a cap: it costs
+# nothing until it is used, and it exists to stop a runaway process
+# taking a node down.
+#
+# This file previously got that backwards, twice, and took the ingress
+# offline both times. `limits.memory: 1Gi` was set from an idle reading
+# of 110-170Mi, which looked generous and was actually below the working
+# set -- all three pods OOMKilled five times under load. Raised to 3Gi
+# from a journey-test peak of 2,751Mi, which then OOMKilled again under a
+# 40,000-arrival burst, because burst memory is a completely different
+# profile: Traefik buffers per in-flight response, and the page is
+# ~610 KB.
+#
+# The lesson is not "find a better number". It is that a limit derived
+# from any single observation will be wrong for the next traffic shape.
+# So there are none: Traefik takes whatever the node has free, and load
+# is absorbed by HORIZONTAL scaling, which Kubernetes decides.
+#
+# Accepted trade-off: with no request the ingress is BestEffort QoS,
+# which is what made it CPU-starved under contention before. Scaling out
+# is the mitigation -- more pods competing for their own share -- rather
+# than a reserved slice.
+# ---------------------------------------------------------------------
 
 deployment:
-  # Was 1 — a single pod carrying all site traffic, so both a throughput
-  # ceiling and a single point of failure.
+  # The floor. autoscaling below raises it on demand; this is what runs
+  # when the site is quiet.
   replicas: 3
 
-# Traefik had NO CPU request or limit at all, which made the ingress
-# carrying 100% of site traffic BestEffort QoS -- the first thing the
-# kernel starves under contention. All three pods also sat on nodes
-# packed with app pods, each of which reserves a guaranteed core.
+# Scale the ingress out under load instead of expecting one hand-picked
+# memory ceiling to cover every traffic shape.
 #
-# This is the suspected cause of the 2026-10-14 journey run going fully
-# unreachable for five minutes: the app peaked at only 29.5 of 63.8
-# worker cores and its medians stayed healthy (home 319 ms) while p95 sat
-# pinned at the 60s client timeout. Uniform overload slows everything;
-# a starved chokepoint keeps serving some requests fast and queues the
-# rest. The second pattern is what we saw.
+# More pods is the right answer for Traefik specifically: its memory is
+# dominated by per-connection buffers, so spreading the same connections
+# over more pods reduces the memory each one needs. Vertical headroom
+# alone cannot do that.
 #
-# A request of 1 is not about needing a whole core -- it is about cgroup
-# CPU weight. BestEffort gets 2 shares; 1 core requested gets 1024, so
-# this is a ~500x improvement in what Traefik wins during contention.
-# The limit of 4 leaves headroom for gzip, which it is now also doing
-# (see test-domains.yaml).
-#
-# Deliberately not higher: o06 has 0.2 cores free, so a large request
-# would leave a Traefik pod Pending and silently cost the ingress a
-# replica. 1 core lets it reschedule onto k27/icf/u4h/cn9.
-# NOTE on the memory limit, learned the hard way on 2026-10-14.
-#
-# The first version of this block set `limits.memory: 1Gi`. Traefik sits
-# at 110-170Mi idle, so that looked generous. Under the 400-arrivals/sec
-# journey run it OOMKilled all three pods five times each and took the
-# ingress -- and therefore every site -- down mid-test.
-#
-# The error was adding a ceiling that did not previously exist. Traefik
-# had no limits at all, so it could take what it needed; "tightening"
-# that to a number derived from idle usage capped it below its working
-# set. Buffers scale with concurrent connections (there were ~17,000
-# in-flight sessions) and gzip adds a compression buffer per response.
-#
-# So: a request that reserves a real floor, and a limit high enough to be
-# a runaway guard rather than an operating ceiling. If this ever OOMs
-# again the answer is to raise it, not to tune it down.
-# 3Gi, not more: Traefik schedules onto nodes with 7.5Gi allocatable, so
-# a 6Gi ceiling would be 80% of the node and risk kubelet eviction of
-# whatever else lives there -- trading an OOM for a worse failure. 3Gi is
-# triple the value that actually OOMed and under half the smallest host.
-# The next load run samples Traefik's real working set so this can be
-# sized from evidence rather than from both guesses.
-resources:
-  requests:
-    cpu: "1"
-    memory: "512Mi"
-  limits:
-    cpu: "4"
-    memory: "3Gi"
+# CPU is the trigger rather than memory because it is the leading
+# indicator: CPU rises as the work arrives, whereas memory rises after
+# it has already been accepted and buffered. By the time memory moves,
+# the latency has happened.
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 12
+  # AverageValue rather than Utilization: utilisation is a percentage of
+  # the REQUEST, and nothing is reserved any more, so a percentage has
+  # no denominator and the HPA would never fire. Absolute target: add
+  # pods whenever the average one is burning more than a core.
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: AverageValue
+          averageValue: "1"
+
 
 additionalArguments:
   # Default is 200: past that, Traefik stops reusing keep-alive

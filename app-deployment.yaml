@@ -110,40 +110,24 @@ spec:
               drop: ["ALL"]
             seccompProfile:
               type: RuntimeDefault
-          resources:
-            # Bumped from 100m/500m request/limit for load-test capacity
-            # planning (see loadtest/) — the cluster has ~40 vCPU of
-            # headroom across 5 nodes, nowhere near used by the app at
-            # the original tiny allocation. Revisit once a real target
-            # concurrency is known; this isn't a final production value.
-            requests:
-              # Raised from 500m to match real observed usage under load
-              # (700-900m/pod) -- the scheduler places pods by request,
-              # not limit, so an under-stated request let it over-pack
-              # the cluster's undersized 4-core nodes with more pods
-              # than they could actually sustain once those pods burst
-              # toward their CPU limit. This is what was actually
-              # causing the ~42-45% failure rate at 10k VUs, not any
-              # server-side resource exhaustion.
-              cpu: 1000m
-              memory: 768Mi
-            limits:
-              # Raised from "2" on 2026-10-13. At 2 cores the hottest
-              # pods were being cgroup-throttled 100% of periods while
-              # other pods sat under half capacity -- 18,689m used of a
-              # 32,000m budget, with traffic distributed roughly 3:1
-              # because Traefik reuses keep-alive connections and so
-              # pins requests to a backend rather than spreading them
-              # per request. Lifting the ceiling lets a pod receiving
-              # several times its share absorb it instead of freezing,
-              # which is cheaper than solving the balancing itself.
-              #
-              # CPU is compressible: a busy pod can simply share. A CPU
-              # *limit* converts that contention into hard freezes, so a
-              # generous ceiling costs nothing until it is used. Memory
-              # stays capped because that is what protects the node.
-              cpu: "6"
-              memory: 2Gi
+          # No requests, no limits -- by policy.
+          #
+          # A request RESERVES capacity whether or not it is used, and the
+          # scheduler places pods on reservations rather than reality. That is
+          # what made this cluster look 79% full while it was 35% used, so
+          # nothing could be placed and "least loaded node" was decided from
+          # fiction. A limit is a ceiling that has to be guessed in advance,
+          # and every guess made here was wrong for the next traffic shape --
+          # it OOMKilled the ingress twice.
+          #
+          # So: nothing is reserved and nothing is capped. Every pod may take
+          # whatever the node has free, and scaling decisions belong to
+          # Kubernetes (see the HorizontalPodAutoscalers) rather than to
+          # hand-picked numbers.
+          #
+          # The accepted trade-off: with no requests every pod is BestEffort
+          # QoS, so under genuine node memory pressure the kubelet evicts
+          # these first and the kernel may OOM-kill them. That is deliberate.
           readinessProbe:
             httpGet:
               path: /healthz
@@ -200,13 +184,24 @@ spec:
               drop: ["ALL"]
             seccompProfile:
               type: RuntimeDefault
-          resources:
-            requests:
-              cpu: 100m
-              memory: 128Mi
-            limits:
-              cpu: 300m
-              memory: 256Mi
+          # No requests, no limits -- by policy.
+          #
+          # A request RESERVES capacity whether or not it is used, and the
+          # scheduler places pods on reservations rather than reality. That is
+          # what made this cluster look 79% full while it was 35% used, so
+          # nothing could be placed and "least loaded node" was decided from
+          # fiction. A limit is a ceiling that has to be guessed in advance,
+          # and every guess made here was wrong for the next traffic shape --
+          # it OOMKilled the ingress twice.
+          #
+          # So: nothing is reserved and nothing is capped. Every pod may take
+          # whatever the node has free, and scaling decisions belong to
+          # Kubernetes (see the HorizontalPodAutoscalers) rather than to
+          # hand-picked numbers.
+          #
+          # The accepted trade-off: with no requests every pod is BestEffort
+          # QoS, so under genuine node memory pressure the kubelet evicts
+          # these first and the kernel may OOM-kill them. That is deliberate.
 ---
 apiVersion: v1
 kind: Service
