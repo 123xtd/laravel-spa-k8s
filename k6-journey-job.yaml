@@ -600,7 +600,11 @@ spec:
                   - key: kubernetes.io/hostname
                     operator: In
                     values:
-                      - talos-icf-5wi
+                      # icf is deliberately dropped now that generators
+                      # need ~7 GB: it has 7.5Gi allocatable in total and
+                      # also hosts a Traefik pod, so a generator there
+                      # would be the next thing to OOM. k27 (32Gi) takes
+                      # three and u4h (15.5Gi) takes one.
                       - talos-k27-emb
                       - talos-u4h-61d
       # Without this the scheduler is free to put all four generators on
@@ -655,7 +659,7 @@ spec:
             #
             # Clear STAIR_STEPS to fall back to the original ramp.
             - name: STAIR_STEPS
-              value: "10,20,30,40,50"
+              value: "40,50,60,70,75"
             - name: STAIR_HOLD
               value: "3m"
             - name: STAIR_RAMP
@@ -688,17 +692,23 @@ spec:
             # success -- the worst failure mode. Two of four generators
             # failed to schedule on the 16k run and produced half-load
             # data that had to be thrown away.
+            # Measured in the staircase run: each generator used 0.4 cores
+            # and 2.9 GB at 200 arrivals/sec site-wide. So these are
+            # memory-hungry and CPU-light, and the earlier 3-core request
+            # was reserving CPU they never touch while the 6Gi limit was
+            # capping the thing they actually need.
+            #
+            # At 75 arrivals/sec each (300 site-wide) the VU budget is
+            # 75 x 45 = 3,375 VUs x 2.12 MB = ~7.2 GB, so 9Gi is the
+            # limit that has to hold -- and the reason this cannot simply
+            # be set to 150/sec: that would want 14 GB per generator and
+            # no node can host several of those beside the app.
             requests:
-              cpu: "3"
-              memory: "2Gi"
-            # Limit cut from 8 to 6: four generators bursting to 8 is 32
-            # cores, and the only node with room for several of them has
-            # 31.9 in total and 14 app pods on it. The generator would win
-            # that fight and we would be measuring a CPU-starved app.
-            # Three cores is the guaranteed floor either way.
+              cpu: "2"
+              memory: "3Gi"
             limits:
               cpu: "6"
-              memory: "6Gi"
+              memory: "9Gi"
       volumes:
         - name: script
           configMap:
