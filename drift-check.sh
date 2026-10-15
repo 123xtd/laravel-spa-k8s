@@ -84,6 +84,47 @@ for f in $(ls *.yaml monitoring/*.yaml 2>/dev/null | grep -Ev "$SKIP"); do
   fi
 done
 
+# ---- the journey ConfigMap, checked on its own ----
+#
+# k6-journey-job.yaml is in SKIP because a completed Job reports every
+# defaulted field and its pod template is immutable, so that diff can
+# never be acted on. But the ConfigMap in the same file is the SCRIPT
+# BOTH RIGS RUN, and skipping the file skipped the script.
+#
+# That cost an outage on 2026-10-15: the script was edited to add soak
+# support, never applied, and the soak then ran the OLD script -- which
+# ignored SOAK, fell through to PEAK_ARRIVALS=400, and asked for 8,100
+# VUs per generator instead of 120. Sixteen of those OOM-killed the
+# generator box. The check that existed to catch exactly this had the
+# file on its skip list.
+#
+# So: the Job stays skipped, the ConfigMap does not.
+if [ -f k6-journey-job.yaml ]; then
+  CMTMP=$(mktemp)
+  if python3 -c "
+import yaml, io, sys
+docs = [d for d in yaml.safe_load_all(io.open('k6-journey-job.yaml')) if d]
+cms = [d for d in docs if d.get('kind') == 'ConfigMap']
+if not cms:
+    sys.exit(1)
+io.open(sys.argv[1], 'w').write(yaml.safe_dump(cms[0], width=100000))
+" "$CMTMP" 2>/dev/null; then
+    if kubectl diff -f "$CMTMP" >/dev/null 2>&1; then
+      say "  same    k6-journey-job.yaml  (ConfigMap: the k6 script)"
+    else
+      DRIFTED+=("k6-journey-job.yaml(ConfigMap)")
+      say "  DRIFT   k6-journey-job.yaml  (ConfigMap: THE SCRIPT BOTH RIGS RUN)"
+      if [ "$QUIET" -eq 0 ]; then
+        say "            apply it with:"
+        say "            python3 -c \"import yaml,io;d=[x for x in yaml.safe_load_all(io.open('k6-journey-job.yaml')) if x];c=[x for x in d if x['kind']=='ConfigMap'][0];io.open('/tmp/cm.yaml','w').write(yaml.safe_dump(c,width=100000))\" && kubectl apply -f /tmp/cm.yaml"
+      fi
+    fi
+  else
+    say "  ?       k6-journey-job.yaml  (could not extract its ConfigMap)"
+  fi
+  rm -f "$CMTMP"
+fi
+
 say ""
 say "=== THESE FILES vs GIT ==="
 say ""

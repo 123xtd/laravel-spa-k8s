@@ -54,6 +54,7 @@ data:
     import { check, sleep } from 'k6';
     import { Trend, Counter } from 'k6/metrics';
     import { b64encode, b64decode } from 'k6/encoding';
+    import exec from 'k6/execution';
 
     const HOST = __ENV.TARGET_HOST || 'www.foasfo.ca';
     const BASE = `https://${HOST}`;
@@ -157,12 +158,132 @@ data:
     // VU pre-allocation has to be sized for the TALLEST step, not the
     // mean: if k6 runs out of VUs it silently stops meeting the target
     // rate, which looks exactly like the server coping.
-    const CEIL = STAIRS ? Math.max.apply(null, STEPS) : PEAK;
+    // CONTINUOUS MODE -- hold one rate for as long as the pod lives.
+    //
+    // The staircase answers "where is the knee". It cannot answer "is the
+    // site still fine at 09:00 tomorrow", because it ends. SOAK=true
+    // replaces the climb with ONE rate held indefinitely, which is the
+    // shape a site actually experiences.
+    //
+    // THE RATE IS PER GENERATOR AND IS MEANT TO STAY FIXED. Site-wide
+    // load is SOAK_RATE x replicas, so the live throttle is the replica
+    // count -- `kubectl scale` -- and no restart is needed to change the
+    // load. Editing SOAK_RATE instead needs a rollout, which is why it
+    // is the gear ratio and not the accelerator.
+    //
+    // SOAK_ROLE splits reads from writes onto separate Deployments, and
+    // that is not tidiness. k6 arrival rates are INTEGERS, and the write
+    // personas are rare: at 24 generators the yard-saler's true share
+    // rounds to zero, gets floored to one per window, and the test then
+    // posts 24x the intended rate. Worse, the inflation GROWS with the
+    // replica count, so scaling the readers would silently change the
+    // write load too and no two moments of the soak would be comparable.
+    // One writer pod at the true site-wide rate has no such floor.
+    const SOAK = (__ENV.SOAK || 'false') === 'true';
+    const SOAK_RATE = parseFloat(__ENV.SOAK_RATE || '6');
+    const SOAK_DURATION = __ENV.SOAK_DURATION || '720h';
+    const SOAK_ROLE = __ENV.SOAK_ROLE || 'both';
+
+    const CEIL = SOAK ? SOAK_RATE : (STAIRS ? Math.max.apply(null, STEPS) : PEAK);
+
+    // PRE-ALLOCATION IS SIZED SEPARATELY FROM THE TALLEST STEP.
+    //
+    // preAllocatedVUs is claimed at startup, before a single request goes
+    // out, and it was derived from CEIL -- the tallest step. That is fine
+    // while the tallest step is one the box can carry. It stops being
+    // fine the moment a staircase deliberately climbs past what the box
+    // can carry: at a 300/sec ceiling (25 per generator) the formula asks
+    // for 500 VUs per generator, 6,000 across twelve, about 12.7 GB on a
+    // box with ~13.5 GB usable. The run would be OOM-killed during
+    // startup and never reach even the first step.
+    //
+    // VU_BUDGET is the per-generator arrival rate to pre-allocate FOR:
+    // set it to the tallest step still expected to be healthy and the
+    // generators begin with exactly what the good steps need. Above it,
+    // k6 grows towards maxVUs and drops iterations while growing -- which
+    // is the honest signature of a rig past its limit, and it arrives as
+    // data instead of as a crash.
+    const VU_BUDGET = parseFloat(__ENV.VU_BUDGET || '') || CEIL;
+    const PRE = Math.min(CEIL, VU_BUDGET);
+
+    // WHICH STEP A SAMPLE CAME FROM.
+    //
+    // The staircase already held each rate long enough to be judged on
+    // its own, but nothing recorded WHICH step a measurement was taken
+    // in, so every sample landed in one undifferentiated pool and the run
+    // could say no more than "the knee is somewhere between 48 and 192
+    // arrivals/sec". Tagging each sample with its step is the whole
+    // difference between that and an answer.
+    //
+    // GENERATORS is used only for labelling -- per-generator rate times
+    // generator count is the site-wide rate, which is the number the
+    // answer gets quoted in. It does not change the load applied (that is
+    // `parallelism` and the rates), so a wrong value here mislabels the
+    // table and nothing else.
+    const GENERATORS = parseInt(__ENV.GENERATORS || '12', 10);
+
+    function secs(d) {
+      const m = String(d).trim().match(/^([\d.]+)\s*(ms|s|m|h)?$/);
+      if (!m) return 0;
+      const v = parseFloat(m[1]);
+      const u = m[2] || 's';
+      return u === 'ms' ? v / 1000 : u === 'm' ? v * 60 : u === 'h' ? v * 3600 : v;
+    }
+
+    const RAMP_S = secs(STAIR_RAMP);
+    const HOLD_S = secs(STAIR_HOLD);
+    const PERIOD_S = RAMP_S + HOLD_S;
+    const STAIR_LABELS = STEPS.map((v, i) => `s${i + 1}_${Math.round(v * GENERATORS)}`);
+
+    // Samples taken while the rate is still CHANGING are labelled 'ramp'
+    // and belong to no step: latency during a transition describes
+    // neither the step below nor the step above. Previously they were
+    // mixed into the totals, which is part of why the tail looked so bad
+    // -- a 30s transition into the next step is 30s of queue drain.
+    //
+    // 'tail' is the write personas outliving the staircase, which they do
+    // by design.
+    function currentStair() {
+      // In soak mode there is no step to attribute a sample to -- the
+      // rate is constant and the axis of interest is wall-clock time,
+      // which Prometheus already has. One label keeps the queries that
+      // filter on `stair` working against both kinds of run.
+      if (SOAK) return 'soak';
+      if (!STAIRS) return 'ramp';
+      const t = exec.instance.currentTestRunDuration / 1000;
+      const i = Math.floor(t / PERIOD_S);
+      if (i >= STEPS.length) return 'tail';
+      return (t - i * PERIOD_S) < RAMP_S ? 'ramp' : STAIR_LABELS[i];
+    }
+
+    // READ RATES ARE PER MINUTE, NOT PER SECOND -- the same trap the
+    // write rates already document, found again at finer steps.
+    //
+    // k6 arrival rates are integers. Each read persona takes a share of
+    // the step (55/28/17), and at one step per second those shares round
+    // to whole numbers so coarse that both the rate and the MIX come out
+    // wrong. At 8 arrivals/sec per generator: 4.4 -> 4, 2.24 -> 2,
+    // 1.36 -> 1, which is 7 per generator, not 8 -- so the step labelled
+    // 96/sec site-wide actually offered 84, and the 2026-10-15 run's
+    // second step was 12.5% below what its own report said.
+    //
+    // At finer steps it gets worse, not better: 4/6/8/10 per generator
+    // would have rounded to 4/6/7/11, turning an even staircase into an
+    // uneven one with a 57% jump in the middle and a mix that drifts from
+    // 57/29/14 to 55/27/18 as it climbs.
+    //
+    // A sixty-second window gives the rounding sixty times the
+    // resolution: every step below now comes out within 0.5% of its
+    // intended rate with the mix held. Pacing is unaffected -- k6 spaces
+    // arrivals evenly across the time unit either way, so 132/minute is
+    // one arrival every 455 ms, exactly as 2.2/sec would be.
+    const READ_UNIT_S = 60;
+    const perUnit = (ratePerSecond) => Math.max(1, Math.round(ratePerSecond * READ_UNIT_S));
 
     function stairStages(weight) {
       const out = [];
       for (const step of STEPS) {
-        const target = Math.max(1, Math.round(step * weight));
+        const target = perUnit(step * weight);
         out.push({ duration: STAIR_RAMP, target });
         out.push({ duration: STAIR_HOLD, target });
       }
@@ -170,7 +291,7 @@ data:
     }
 
     function stages(weight) {
-      const at = (f) => Math.max(1, Math.round(PEAK * weight * f));
+      const at = (f) => perUnit(PEAK * weight * f);
       return [
         { duration: dur(1), target: at(0.15) },
         { duration: dur(2), target: at(0.15) },
@@ -186,10 +307,30 @@ data:
 
     // Read persona: ramps with overall traffic.
     function readScenario(exec, weight) {
+      // Soak: one rate, held. preAllocatedVUs is the FULL steady-state
+      // demand (Little's Law: rate x 20s session), not a fraction of it,
+      // because a soak has no ramp during which to grow -- a replica
+      // scaled up at 14:00 must be at its rate within seconds or the
+      // site-wide figure is wrong for as long as it takes to grow, and
+      // k6 drops scheduled iterations while growing.
+      if (SOAK) {
+        return {
+          executor: 'constant-arrival-rate',
+          exec,
+          timeUnit: `${READ_UNIT_S}s`,
+          rate: perUnit(SOAK_RATE * weight),
+          duration: SOAK_DURATION,
+          preAllocatedVUs: Math.max(20, Math.round(SOAK_RATE * weight * 20)),
+          maxVUs: Math.max(60, Math.round(SOAK_RATE * weight * 36)),
+        };
+      }
       return {
         executor: 'ramping-arrival-rate',
         exec,
-        timeUnit: '1s',
+        // Per minute -- see perUnit() above. The VU sizing below stays in
+        // arrivals per SECOND, because Little's Law is about concurrency
+        // and that does not care how the rate is spelled.
+        timeUnit: `${READ_UNIT_S}s`,
         startRate: 1,
         // Generous headroom: if k6 runs out of VUs it silently stops
         // hitting the target rate, which looks like the server coping.
@@ -204,21 +345,38 @@ data:
         //   CEIL=50  mult=50  ->  2,500 VUs =  5.2 GB   OOMs a 6Gi limit
         //   CEIL=100 mult=45  ->  4,500 VUs =  9.5 GB   needs ~11Gi
         //
-        // Sessions average ~30s, so each sustained arrival/sec needs ~30
-        // concurrent VUs. 40 was barely above that minimum, which is why
-        // an early run peaked at 96% of its VU ceiling.
-        //
         // 36 (20% headroom) rather than 45, because of what the ceiling
         // question actually requires. PAST the knee, VU demand is
         // unbounded: the site slows, sessions stop completing, and the
         // generator needs ever more VUs to sustain the same arrival rate.
         // No allocation survives that. What matters is that the
         // generators are healthy up to and including the last GOOD step,
-        // where sessions do complete in ~30s and demand is predictable.
-        // Spending memory on surviving past the breaking point buys
-        // nothing and costs reach -- 36 instead of 45 is 25% more
-        // arrivals from the same RAM.
-        preAllocatedVUs: Math.max(20, Math.round(CEIL * weight * 8)),
+        // where sessions complete predictably. Spending memory on
+        // surviving past the breaking point buys nothing and costs
+        // reach -- 36 instead of 45 is 25% more arrivals from the same
+        // RAM.
+        //
+        // preAllocatedVUs was 8x, and that was the bug the smoke run
+        // found. k6 pre-allocates this many at startup and grows towards
+        // maxVUs only as demand appears -- and while it is growing it
+        // DROPS scheduled iterations. The smoke run reported 44 dropped
+        // per generator at 3 arrivals/sec, which no server could have
+        // caused.
+        //
+        // The multiplier has to be the real session length, because that
+        // is what Little's Law requires: concurrent = arrival rate x
+        // session duration. Measured on that run, iteration_duration
+        // averaged 17.3s (p95 38.9s), so each sustained arrival/sec
+        // needs ~17 concurrent VUs, not 8. The old comment here assumed
+        // ~30s, which was a guess in the other direction; 20 is the
+        // measured 17.3 with a small margin.
+        //
+        // Cost at the real staircase: CEIL 16 x 20 = 320 VUs per
+        // generator pre-allocated, 3,840 across twelve, about 8 GB.
+        // That is memory that steady state needs anyway -- 192
+        // arrivals/sec x 17.3s is ~3,300 concurrent VUs -- so it is
+        // brought forward, not added.
+        preAllocatedVUs: Math.max(20, Math.round(PRE * weight * 20)),
         maxVUs: Math.max(100, Math.round(CEIL * weight * 36)),
         stages: STAIRS ? stairStages(weight) : stages(weight),
       };
@@ -230,17 +388,120 @@ data:
       return {
         executor: 'constant-arrival-rate',
         exec,
-        rate: Math.max(1, Math.round(ratePerSecond * 60)),
-        timeUnit: '1m',
-        duration: WRITE_DURATION,
+        // Rate expressed per TEN minutes, not per minute.
+        //
+        // k6 needs an integer rate, and `Math.max(1, ...)` floors it at
+        // one per window. Splitting the same site-wide write load across
+        // 12 generators instead of 8 makes each per-generator rate small
+        // enough to hit that floor: a yard-sale rate of 0.00667/s rounds
+        // to 0 per minute, gets floored to 1, and the test then posts
+        // 0.2 yard sales a second site-wide instead of 0.08 -- 2.5x the
+        // intended write load, silently. The poster rate was 25% over
+        // for the same reason.
+        //
+        // A ten-minute window gives the rounding ten times the
+        // resolution, so 0.00667/s becomes exactly 4 per 10m and the
+        // rare personas stay rare.
+        rate: Math.max(1, Math.round(ratePerSecond * 600)),
+        timeUnit: '10m',
+        duration: SOAK ? SOAK_DURATION : WRITE_DURATION,
         preAllocatedVUs: Math.max(5, Math.ceil(ratePerSecond * 30)),
         maxVUs: Math.max(20, Math.ceil(ratePerSecond * 200)),
       };
     }
 
+    // PER-STEP REPORTING, AND WHY IT IS DONE WITH THRESHOLDS.
+    //
+    // k6 only materialises a tagged submetric -- `step_home{stair:s3_96}`
+    // -- if something refers to it, and a threshold is the only thing
+    // that can. So the ones below are declared for their side effect:
+    // each makes its step's numbers appear separately, per staircase
+    // step, in the summary and in handleSummary's data. The limits are
+    // deliberately unreachable; these are not judgements, they are the
+    // table of contents.
+    const STAIR_METRICS = [
+      'http_reqs', 'http_req_failed', 'http_req_duration', 'iteration_duration',
+      'step_home', 'step_subcategory', 'step_listings_index', 'step_search',
+      'step_listing_detail', 'step_login', 'step_save_ad', 'step_contact_seller',
+      'step_post_form', 'step_publish_ad', 'step_post_yard_sale',
+    ];
+
+    // Which personas this pod runs. 'both' is every run that is not a
+    // split soak; a missing key simply means the scenario is not started.
+    function pickScenarios(all) {
+      if (!SOAK || SOAK_ROLE === 'both') return all;
+
+      const READ = ['scroller', 'searcher', 'checker'];
+      const WRITE = ['saver', 'enquirer', 'poster', 'yardsaler'];
+      let keep;
+
+      // Singular and plural both accepted, because the StatefulSets are
+      // named k6-soak-readers and k6-soak-writer and the env was written
+      // to match the names.
+      if (SOAK_ROLE === 'readers' || SOAK_ROLE === 'reader') keep = READ;
+      else if (SOAK_ROLE === 'writers' || SOAK_ROLE === 'writer') keep = WRITE;
+      // THROW, rather than defaulting to one of them.
+      //
+      // This previously fell back to READ for any unrecognised value, so
+      // SOAK_ROLE=writer -- off by one letter -- quietly produced a
+      // "writer" pod running the read personas: no write load at all,
+      // plus an extra generator's worth of reads, and nothing in the
+      // output said so. A soak that silently applies the wrong traffic
+      // is worse than one that refuses to start.
+      else throw new Error(`SOAK_ROLE must be readers, writers or both -- got "${SOAK_ROLE}"`);
+
+      const out = {};
+      for (const k of keep) out[k] = all[k];
+      return out;
+    }
+
+    function stairThresholds() {
+      // The four real judgements, reported and not enforced: the run has
+      // to finish so the whole curve is visible, including past the knee.
+      const t = {
+        http_req_failed: ['rate<0.01'],
+        'step_home': ['p(95)<1000'],
+        'step_listings_index': ['p(95)<2000'],
+        'step_publish_ad': ['p(95)<5000'],
+      };
+      // Soak has one step, so there is nothing to break out -- and a
+      // soak never prints a summary anyway (the pod does not end), so
+      // the submetrics would exist only to be discarded.
+      if (SOAK) return t;
+      for (const label of STAIR_LABELS.concat(['ramp', 'tail'])) {
+        for (const m of STAIR_METRICS) {
+          t[`${m}{stair:${label}}`] = m === 'http_reqs' ? ['count>=0']
+            : m === 'http_req_failed' ? ['rate<=1']
+            : ['p(95)<3600000'];
+        }
+      }
+      return t;
+    }
+
     export const options = {
       hosts: { [HOST]: __ENV.LB_IP || '192.168.100.200' },
-      scenarios: {
+      // WHO SENT THIS SAMPLE, and why Prometheus needs to be told.
+      //
+      // Twelve generators push to one Prometheus. Without something to
+      // tell them apart they all write the SAME series -- same metric,
+      // same labels -- and Prometheus rejects the collisions as duplicate
+      // samples for a timestamp. Eleven generators' worth of data would
+      // disappear into an error log, which is the same failure as before
+      // wearing different clothes.
+      //
+      // The pod name is the natural identity and it comes in from a
+      // fieldRef. Queries that want the site-wide figure just do not
+      // group by it.
+      tags: { gen: __ENV.POD_NAME || 'unknown' },
+      // CARDINALITY. k6 tags every request with `url` and `name`, and
+      // this test fetches /listings/{id} with ~98,000 possible ids -- so
+      // the default tag set would create a Prometheus series per listing
+      // ever viewed, for every metric, times twelve generators. The
+      // per-step trends carry the information those tags would have, so
+      // the tags go.
+      systemTags: ['status', 'method', 'error_code', 'expected_response',
+                   'scenario', 'check', 'group'],
+      scenarios: pickScenarios({
         scroller:  readScenario('scroller', WEIGHT.scroller),
         searcher:  readScenario('searcher', WEIGHT.searcher),
         checker:   readScenario('checker',  WEIGHT.checker),
@@ -248,15 +509,13 @@ data:
         enquirer:  writeScenario('enquirer',  WRITE_RATE.enquirer),
         poster:    writeScenario('poster',    WRITE_RATE.poster),
         yardsaler: writeScenario('yardsaler', WRITE_RATE.yardsaler),
-      },
-      // Reported, not enforced: the run must finish so the whole curve is
-      // visible, including past the breaking point.
-      thresholds: {
-        http_req_failed: ['rate<0.01'],
-        'step_home': ['p(95)<1000'],
-        'step_listings_index': ['p(95)<2000'],
-        'step_publish_ad': ['p(95)<5000'],
-      },
+      }),
+      thresholds: stairThresholds(),
+      // `count` is what turns a step into an achieved rate: count over the
+      // hold's duration, summed across generators, is the traffic the site
+      // actually completed at that step. Without it a step that quietly
+      // stopped meeting its target looks like a step the site handled.
+      summaryTrendStats: ['count', 'avg', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],
       // Response bodies are 50-85 KB; at thousands of VUs that is real
       // generator memory. Only keep them where the script parses one.
       discardResponseBodies: true,
@@ -288,8 +547,15 @@ data:
     }
 
     function step(trend, name, fn) {
+      // Set on the VU BEFORE the request, so k6's own http_req_* metrics
+      // carry the step too -- not just the custom trend below. That is
+      // what makes per-step throughput and failure rates readable, and
+      // those are the two figures that can be summed across generators
+      // exactly.
+      const stair = currentStair();
+      exec.vu.tags.stair = stair;
       const res = fn();
-      trend.add(res.timings.duration);
+      trend.add(res.timings.duration, { stair });
       const ok = check(res, { [name]: (r) => r.status === 200 || r.status === 302 });
       if (!ok) stepErrors.add(1, { step: name });
       return res;
@@ -313,8 +579,10 @@ data:
     ];
 
     function writeStep(trend, name, submittedFrom, fn) {
+      const stair = currentStair();
+      exec.vu.tags.stair = stair;
       const res = fn();
-      trend.add(res.timings.duration);
+      trend.add(res.timings.duration, { stair });
       const dest = String(res.headers['Location'] || '');
       const ok = check(res, {
         [name]: (r) => r.status === 302 && dest !== '' && !dest.includes(submittedFrom),
@@ -554,8 +822,9 @@ data:
       // `starts_at` and `ends_at` are not fields, and photos arrive as
       // `pictures`, not `images`. Sending the wrong shape made this step
       // report success while writing nothing.
+      const title = `Yard sale ${__VU}-${__ITER}`;
       const payload = {
-        title: `Yard sale ${__VU}-${__ITER}`,
+        title,
         address: '12 Test Road, Testville',
         date: 'Saturday 1 December',
         times: '9am - 2pm',
@@ -567,9 +836,110 @@ data:
       for (let i = 0; i < 2; i++) {
         payload[`pictures[${i}]`] = http.file(PHOTO, `yard${i}.png`, 'image/png');
       }
-      writeStep(T.yardSale, 'post_yard_sale', '/yard-sales', () => http.post(`${BASE}/yard-sales`, payload,
-        { headers: headers({ 'X-XSRF-TOKEN': csrf(), Referer: `${BASE}/yard-sales` }), redirects: 0 }));
+
+      // NOT writeStep(), and the reason matters.
+      //
+      // writeStep()'s rule is "a real success redirects somewhere ELSE
+      // than the submitting page", which is right for publish_ad and
+      // contact_seller. Here it is not merely wrong, it is INVERTED.
+      // YardSaleController::store() ends in `back()`, so a successful
+      // create redirects to the Referer -- /yard-sales -- which is the
+      // very URL a validation failure returns to. So the check failed
+      // on every successful create, and the ones it passed were the
+      // genuine failures that redirected somewhere else. The smoke run
+      // reported 37% passing; the truth was close to its inverse.
+      //
+      // `back()` is correct for the site: the Inertia panel stays open
+      // and the list refreshes. So the test changes, not the controller.
+      // The only honest proof a row was written is to read it back, and
+      // the unique title makes that unambiguous.
+      //
+      // The extra GET is affordable precisely because this is the
+      // rarest persona -- one yard sale per 12 seconds site-wide.
+      // Tagged by hand because this step deliberately does not use
+      // writeStep() -- see the note above.
+      exec.vu.tags.stair = currentStair();
+      const posted = http.post(`${BASE}/yard-sales`, payload,
+        { headers: headers({ 'X-XSRF-TOKEN': csrf(), Referer: `${BASE}/yard-sales` }), redirects: 0 });
+      T.yardSale.add(posted.timings.duration);
+      const listed = posted.status === 302 ? get('/yard-sales') : null;
+      const yardSaleOk = check(posted, {
+        post_yard_sale: () => posted.status === 302
+          && listed !== null
+          && listed.status === 200
+          && String(listed.body).includes(title),
+      });
+      if (!yardSaleOk) stepErrors.add(1, { step: 'post_yard_sale' });
       think(8, 0.7);
+    }
+
+    // THE TWELVE SUMMARIES PROBLEM.
+    //
+    // Each generator prints its own summary and they do not combine the
+    // same way. Counts and rates add exactly; a p95 does not -- it is a
+    // position in one generator's sample set, so averaging twelve of them
+    // means nothing. The honest merge treats the twelve as twelve
+    // estimates of the same quantity and reports their median with the
+    // spread, which is what k6-journey-merge.py does.
+    //
+    // This emits one machine-readable line per generator for it to read.
+    // Defining handleSummary replaces k6's own end-of-test summary, so a
+    // short human table goes out alongside it -- enough to read a smoke
+    // run straight from `kubectl logs` without the collector.
+    function statOf(data, metric, label, stat) {
+      const m = data.metrics[`${metric}{stair:${label}}`];
+      return m && m.values ? m.values[stat] : undefined;
+    }
+
+    function asMs(v) {
+      if (v === undefined || v === null) return '-';
+      return v >= 1000 ? (v / 1000).toFixed(2) + 's' : v.toFixed(0) + 'ms';
+    }
+
+    function humanTable(data) {
+      const pad = (v, w) => String(v).padStart(w);
+      const lines = ['', `  this generator only -- ${GENERATORS} of these merge into the real numbers`,
+        `  ${'step'.padEnd(10)}${pad('reqs', 8)}${pad('fail%', 8)}${pad('home p95', 11)}` +
+        `${pad('listings p95', 14)}${pad('detail p95', 12)}${pad('iter p95', 10)}`];
+      for (const label of STAIR_LABELS.concat(['tail'])) {
+        const reqs = statOf(data, 'http_reqs', label, 'count');
+        if (!reqs) continue;
+        const passes = statOf(data, 'http_req_failed', label, 'passes') || 0;
+        const fails = statOf(data, 'http_req_failed', label, 'fails') || 0;
+        const checked = passes + fails;
+        lines.push(`  ${label.padEnd(10)}${pad(reqs, 8)}` +
+          `${pad(checked ? (100 * passes / checked).toFixed(2) : '-', 8)}` +
+          `${pad(asMs(statOf(data, 'step_home', label, 'p(95)')), 11)}` +
+          `${pad(asMs(statOf(data, 'step_listings_index', label, 'p(95)')), 14)}` +
+          `${pad(asMs(statOf(data, 'step_listing_detail', label, 'p(95)')), 12)}` +
+          `${pad(asMs(statOf(data, 'iteration_duration', label, 'p(95)')), 10)}`);
+      }
+      const dropped = data.metrics.dropped_iterations;
+      lines.push(`  dropped iterations: ${dropped ? dropped.values.count : 0}` +
+        `   login failures: ${data.metrics.login_failures ? data.metrics.login_failures.values.count : 0}`);
+      lines.push('');
+      return lines.join('\n');
+    }
+
+    export function handleSummary(data) {
+      const out = {
+        host: HOST,
+        generators: GENERATORS,
+        steps: STEPS,
+        labels: STAIR_LABELS,
+        ramp_s: RAMP_S,
+        hold_s: HOLD_S,
+        metrics: {},
+      };
+      for (const key of Object.keys(data.metrics)) {
+        out.metrics[key] = data.metrics[key].values;
+      }
+      // One line, one JSON object, so twelve pod logs can be parsed
+      // without caring what else k6 printed around it.
+      return {
+        stdout: humanTable(data) +
+          '\nJOURNEY_SUMMARY_JSON ' + JSON.stringify(out) + '\n',
+      };
     }
 ---
 apiVersion: batch/v1
@@ -578,8 +948,45 @@ metadata:
   name: k6-journey
   namespace: laravel-spa
 spec:
-  parallelism: 8
-  completions: 8
+  # TWELVE generators, deliberately more than the 8 threads on the box.
+  #
+  # The narrow reasoning says use fewer: they all share loadgen's 16 GB,
+  # so extra processes spend memory on Go runtimes instead of virtual
+  # users, and 12 runtimes on 8 cores contend. Both true, and both minor
+  # -- about 800 MB, or 6-12 arrivals/sec of reach.
+  #
+  # What overrides them is how the traffic is SHAPED, which an earlier
+  # run already demonstrated: spread-out arrivals behave differently from
+  # arrivals queued behind one another, and the queueing happens inside
+  # the GENERATOR, not on the site.
+  #
+  # Each k6 process keeps its own HTTP connection pool. Over TLS to
+  # Traefik those are HTTP/2 connections, where many requests multiplex
+  # over a handful of TCP sockets subject to a per-connection stream
+  # limit. Four processes is four pools and a small total stream budget,
+  # so requests wait for a free stream before they are even sent -- and
+  # k6 clocks that wait as SERVER latency, because its timer starts when
+  # the request is queued, not when it goes out. Twelve processes is
+  # twelve pod IPs, twelve pools, 3x the concurrent streams and 3x the
+  # ephemeral port space (~28k per source IP, which binds once TIME_WAIT
+  # accumulates at high rates).
+  #
+  # So this is not about using more of the machine: with no requests and
+  # no limits, any pod count uses all of it. It is about not fabricating
+  # latency inside the measuring instrument -- the same error as running
+  # generators on the nodes under test, which this box exists to end.
+  #
+  # GOMAXPROCS=2 below is what makes 12 affordable. Without it each
+  # process sees 8 CPUs and starts 8 scheduler threads, so 12 pods would
+  # run ~96 threads over 8 cores. Pinned at 2 it is 24, which the kernel
+  # absorbs without thrashing, and no throughput is lost because only 8
+  # can run at once regardless.
+  #
+  # GENERATOR COUNT IS LOAD-BEARING: every per-generator rate below is an
+  # ABSOLUTE rate, not a share of a total, so changing `parallelism`
+  # without rescaling them changes the load the test applies.
+  parallelism: 12
+  completions: 12
   backoffLimit: 0
   template:
     metadata:
@@ -587,59 +994,88 @@ spec:
         app: k6-journey
     spec:
       restartPolicy: Never
-      # Only five of the eight nodes can run a generator at all: the other
-      # three are control planes, tainted NoSchedule, which is why they
-      # look invitingly idle in `kubectl top` and are not. Of the five,
-      # o06 and cn9 have under 1.5 cores free, so the request below would
-      # leave a generator Pending there.
+      # The dedicated generator box, and nowhere else.
       #
-      # icf is listed first on purpose -- it carries no app pods, so a
-      # generator there competes with nothing. k27 and u4h between them
-      # host 21 of the 24 pods under test, so a generator landing on one
-      # is taking CPU from the thing being measured. That understates
-      # capacity rather than overstating it, but it is worth avoiding
-      # where there is a choice, hence the spread constraint below.
-      affinity:
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-              - matchExpressions:
-                  - key: kubernetes.io/hostname
-                    operator: In
-                    values:
-                      # All five worker nodes, which is the point of
-                      # running eight smaller generators instead of four
-                      # large ones. Only k27 (32Gi) and u4h (15.5Gi) could
-                      # host a 9Gi generator, and that -- not the cluster's
-                      # total memory -- was what capped load generation.
-                      # The other three have ~5.2Gi free each, plenty for
-                      # a 4Gi generator, so splitting the same total VU
-                      # budget into smaller pieces reaches 49Gi of free
-                      # memory instead of 33Gi.
-                      #
-                      # The other three nodes are control planes, tainted
-                      # NoSchedule, and are not available at all.
-                      - talos-cn9-j91
-                      - talos-icf-5wi
-                      - talos-o06-xjv
-                      - talos-k27-emb
-                      - talos-u4h-61d
-      # Without this the scheduler is free to put all four generators on
-      # k27, since it has the most free CPU -- which is also where 14 of
-      # the pods under test live. Spreading them means at most two share
-      # a node.
-      topologySpreadConstraints:
-        - maxSkew: 1
-          topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: ScheduleAnyway
-          labelSelector:
-            matchLabels:
-              app: k6-journey
+      # This used to list five cluster nodes and spread generators across
+      # them, which was the best available answer when there was nowhere
+      # else to put them -- but it meant the measuring instrument always
+      # shared cores with the thing being measured. k27 and u4h between
+      # them hosted 21 of the 24 pods under test, so a generator landing
+      # on either took CPU from the site and understated its capacity by
+      # an amount nobody could quantify.
+      #
+      # `loadgen` (192.168.100.102) carries nothing else: labelled
+      # workload=loadtest, tainted dedicated=loadtest:NoSchedule. The
+      # selector finds it; the taint keeps app pods, Longhorn and the
+      # exporters away. The toleration is what lets THESE pods past the
+      # taint -- drop it and they sit Pending forever.
+      #
+      # The spread constraint is gone with the multi-node list: there is
+      # one eligible node, so there is nothing to spread across.
+      nodeSelector:
+        workload: loadtest
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: loadtest
+          effect: NoSchedule
       containers:
         - name: k6
           image: grafana/k6:latest
-          args: ["run", "/scripts/journey.js"]
+          # WHY THE EXIT CODE IS THROWN AWAY.
+          #
+          # k6 exits 99 when a threshold is crossed, and crossing one is
+          # the expected outcome of a run whose purpose is to find the
+          # breaking point. With `backoffLimit: 0` the first generator to
+          # exit 99 fails the Job, and the Job controller then deletes the
+          # eleven still-running pods -- mid-summary, taking their results
+          # with them. That is how the 2026-10-15 run came back with one
+          # generator's numbers (23,062 requests, 21/s) instead of twelve,
+          # and nothing in the output said so.
+          #
+          # The verdict of a load test is in the summary, not the exit
+          # code, so k6's is reported and discarded.
+          command:
+            - sh
+            - -c
+            - k6 run /scripts/journey.js; echo "k6 exit=$?"; exit 0
           env:
+            # Pinned, and load-bearing at 12 generators -- see the note on
+            # `parallelism`. Without it each k6 process sees all 8 CPUs
+            # and starts 8 scheduler threads.
+            - name: GOMAXPROCS
+              value: "2"
+            # STREAM THE RESULTS OUT WHILE THE RUN IS HAPPENING.
+            #
+            # A generator's summary used to exist only inside its own
+            # process until the very end, so a generator that died took
+            # its results with it -- and at the top of a staircase that
+            # climbs past what the box can carry, dying is the EXPECTED
+            # outcome. k6 pushes to Prometheus every 5 seconds instead, so
+            # a generator killed at step 7 still leaves steps 1-6 intact.
+            #
+            # It also fixes the merge: as native histograms the twelve
+            # generators' latencies are additive, so a site-wide p95 is
+            # the real quantile of all of it rather than the median of
+            # twelve separate estimates.
+            - name: K6_OUT
+              value: experimental-prometheus-rw
+            - name: K6_PROMETHEUS_RW_SERVER_URL
+              value: http://prometheus.monitoring.svc.cluster.local:9090/api/v1/write
+            - name: K6_PROMETHEUS_RW_TREND_AS_NATIVE_HISTOGRAM
+              value: "true"
+            - name: K6_PROMETHEUS_RW_PUSH_INTERVAL
+              value: 5s
+            - name: K6_PROMETHEUS_RW_STALE_MARKERS
+              value: "true"
+            # Twelve generators writing one Prometheus need to be
+            # distinguishable, or they all write the same series and the
+            # collisions are dropped as duplicate samples. See the `tags`
+            # option in the script.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: TARGET_HOST
               value: "www.foasfo.ca"
             - name: LB_IP
@@ -650,25 +1086,33 @@ spec:
                   name: loadtest-credentials
                   key: BASIC_AUTH
             # Total peak arrivals/sec across all personas, per generator.
-            # 4 generators x 100 = 400/sec site-wide. Start low; this is
-            # arrivals, not concurrency, so it is NOT comparable to the
-            # old VUS_PER_POD numbers.
+            # Only used when STAIR_STEPS is cleared. 12 x 67 = 804/sec
+            # site-wide, matching the eight-generator arrangement's 800.
+            # This is arrivals, not concurrency, so it is NOT comparable
+            # to the old VUS_PER_POD numbers.
             - name: PEAK_ARRIVALS
-              value: "100"
-            # Halved because the generator count doubled. These are
-            # per-generator ABSOLUTE rates, not a share of arrivals, so
-            # going from four generators to eight would otherwise double
-            # the site-wide write load and change what the test measures.
-            # Site-wide these stay at 8/s saves, 4/s enquiries, ~1 ad
-            # every 3s, ~1 yard sale every 12s.
+              value: "67"
+            # Scaled by 8/12, because the generator count went 8 -> 12.
+            # These are per-generator ABSOLUTE rates, not shares of a
+            # total, so leaving them alone would have raised the
+            # site-wide write load by half and changed what the test
+            # measures. Site-wide they are unchanged: 8/s saves, 4/s
+            # enquiries, ~1 ad every 3s, ~1 yard sale every 12s.
+            #
+            # STILL OUTSTANDING, deliberately not changed here: 0.32 ads/s
+            # site-wide is 27,600 a day against a real expectation of
+            # ~300. Fixing that in the same run as the rig move would
+            # leave no way to tell which change moved the numbers, so it
+            # waits. The value for 300/day is RATE_POSTER=0.00058 at 12
+            # generators.
             - name: RATE_SAVER
-              value: "1"
+              value: "0.667"
             - name: RATE_ENQUIRER
-              value: "0.5"
+              value: "0.333"
             - name: RATE_POSTER
-              value: "0.04"
+              value: "0.0267"
             - name: RATE_YARDSALER
-              value: "0.01"
+              value: "0.00667"
             - name: RECAPTCHA_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -684,18 +1128,85 @@ spec:
             # verifying the personas work before committing to a long run.
             # Staircase: per-generator arrival rates, each approached then
             # HELD so latency settles and every step is judged on its own.
-            # Four generators, so site-wide this is 40/80/120/160/200 per
-            # second. Chosen to straddle the suspected ceiling: runs 2 and
-            # 4 completed 85-116 sessions/sec site-wide.
-            #
             # Clear STAIR_STEPS to fall back to the original ramp.
-            # Per-generator; EIGHT generators now, so site-wide this is
-            # 160/200/256/320/400 per second. The first two levels repeat
-            # the known-good result (160 clean, 200 clean after Redis was
-            # lifted) so each run re-validates its own baseline before
-            # pushing into new territory.
+            #
+            # Twelve generators, so site-wide this is
+            # 48/72/96/120/144/168/192 per second. Integers per generator
+            # on purpose -- k6 arrival rates are integers, and 12 does not
+            # divide 40/80/120/160 evenly, so chasing the old figures
+            # exactly would have meant rounding each step and reporting a
+            # rate the test never ran. 192 sits just under the last
+            # known-good 200.
+            #
+            # SEVEN steps rather than four, over the same span. The
+            # 2026-10-15 run used 48/96/144/192 and its finding was that
+            # the knee is "somewhere between 48 and 192" -- a 4x band,
+            # which is not an answer. 24-arrival/sec steps halve the
+            # resolution of that band, and because every sample now
+            # carries the step it was taken in, one run reads the whole
+            # curve instead of needing a bisecting run per guess.
+            #
+            # Cost: 7 x 3m30s = 24m30s instead of 14m. Generator memory
+            # is unchanged, because pre-allocation is sized by the
+            # TALLEST step (16/generator) and that has not moved.
+            #
+            # The top step is set by the generator's memory, and the
+            # arithmetic is worth writing down because this is now the
+            # ceiling that binds:
+            #
+            #   journey VU            2.12 MB  (measured: 2.9GB / 1,366 VUs)
+            #   loadgen usable RAM    ~14 GB   (16 less Talos + kubelet)
+            #   12 Go runtimes        ~0.8 GB
+            #   -> concurrent VUs     ~6,200
+            #   sessions last ~30s, so each sustained arrival/sec needs
+            #   ~30 concurrent VUs
+            #   -> ~205 arrivals/sec, and 192 keeps a margin
+            #
+            # So the rig can no longer out-drive the site: ~200/sec is
+            # both the last known-good site figure AND roughly this box's
+            # limit. Past the knee VU demand is unbounded -- the site
+            # slows, sessions stop completing, and k6 needs ever more VUs
+            # to hold the rate -- so at the top step a degrading site
+            # will OOM the generator before its failure is characterised.
+            #
+            # That is the honest limit of this box, and it is a RAM limit:
+            # not CPU, not the NIC, not the pod count. loadgen has two
+            # free DIMM slots and takes 64 GB. At 48 GB the ceiling moves
+            # to roughly 600 arrivals/sec, which is the headroom needed
+            # to find the SITE's next breaking point instead of the rig's.
+            # 48/90/132/174/216/258/300 arrivals/sec site-wide.
+            #
+            # The top two steps are BEYOND WHAT THIS BOX CAN GENERATE, and
+            # that is a deliberate choice rather than an oversight. The
+            # rig's own ceiling is ~200/sec: a visitor costs 2.12 MB of
+            # generator memory, sessions last 17-31s, so 300/sec needs
+            # 5,200-9,500 concurrent VUs, i.e. 11-20 GB on a box with
+            # ~13.5 GB usable.
+            #
+            # Running into that knowingly is worth it now only because the
+            # results no longer die with the generators (see K6_OUT
+            # above). Steps 1-5 are inside the rig's budget and measure the
+            # SITE. Steps 6-7 measure the RIG failing, which is itself the
+            # measurement that says what the box needs -- and anything
+            # they report about latency is the generator's own memory
+            # pressure, not the site's.
+            #
+            # Fractional per-generator rates are fine now that read rates
+            # are expressed per minute: 7.5/gen is exactly 450/minute.
             - name: STAIR_STEPS
-              value: "20,25,32,40,50"
+              value: "4,7.5,11,14.5,18,21.5,25"
+            # Pre-allocate for the tallest HEALTHY step (16/gen = 192/sec
+            # site-wide), not for the 25/gen ceiling -- pre-allocating for
+            # 25 would claim 12.7 GB at startup and be OOM-killed before
+            # the first step. See VU_BUDGET in the script.
+            - name: VU_BUDGET
+              value: "16"
+            # Labels only: per-generator rate x GENERATORS is the
+            # site-wide rate the results are quoted in. Must match
+            # `parallelism` above or the table is mislabelled -- it does
+            # not change the load applied.
+            - name: GENERATORS
+              value: "12"
             - name: STAIR_HOLD
               value: "3m"
             - name: STAIR_RAMP
@@ -706,11 +1217,12 @@ spec:
               value: "false"
             - name: RAMP_UNIT
               value: "1m"
-            # Must span the whole staircase (5 steps x 3m30s = 17m30s),
-            # or the write personas stop partway and the taller steps get
-            # measured without them.
+            # Must span the whole staircase -- 7 steps x (30s ramp + 3m
+            # hold) = 24m30s -- or the write personas stop partway and the
+            # taller steps get measured without them, which would make the
+            # top of the curve quietly easier than the bottom.
             - name: WRITE_DURATION
-              value: "18m"
+              value: "26m"
             - name: ACCOUNT_COUNT
               value: "200"
             - name: ACCOUNT_PASSWORD
