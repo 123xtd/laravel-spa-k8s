@@ -13,10 +13,15 @@
 #   kubectl create secret generic mysqld-exporter -n monitoring \
 #     --from-literal=password='<the laravel DB password>'
 #
-# The `laravel` user was granted PROCESS on 2026-10-13, which is what
-# lets the exporter read engine state. Without it, half these metrics
-# are silently missing -- and `information_schema.processlist` shows
-# only the exporter's own connection, which reads as an idle server.
+# PROCESS was believed to have been granted to `laravel` on 2026-10-13.
+# It was NOT: first run of this exporter on 2026-10-15 was refused with
+# "you need (at least one of) the PROCESS privilege(s)". The engine-state
+# scraper is disabled below as a result, and `SHOW ENGINE INNODB STATUS`
+# plus `information_schema.processlist` remain unavailable -- the latter
+# shows only the exporter's own connection, which reads as an idle
+# server. Everything in global_status/global_variables works, which is
+# where the metrics that matter live (queries/sec, rows read,
+# threads_running, connections).
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -48,7 +53,24 @@ spec:
             - --collect.global_status
             - --collect.global_variables
             - --collect.info_schema.innodb_metrics
-            - --collect.engine_innodb_status
+            # engine_innodb_status and slave_status are OFF, and both for
+            # the same reason: the `laravel` user does not have the
+            # privilege, so each one issued a query that was refused on
+            # every scrape -- an error line every 15 seconds and a
+            # pointless round trip to the database box.
+            #
+            #   engine_innodb_status  needs PROCESS
+            #   slave_status          needs REPLICATION CLIENT (or SUPER)
+            #
+            # slave_status is simply not applicable -- there is no
+            # replica. engine_innodb_status IS worth having (buffer pool
+            # and lock detail during a stall), so to re-enable it:
+            #
+            #   GRANT PROCESS ON *.* TO 'laravel'@'%';
+            #
+            # then drop the --no-collect line below and restore
+            # --collect.engine_innodb_status.
+            - --no-collect.slave_status
           env:
             - name: MYSQLD_EXPORTER_PASSWORD
               valueFrom:

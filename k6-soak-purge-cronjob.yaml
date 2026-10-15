@@ -1,0 +1,70 @@
+# DO NOT APPLY THIS YET. It deletes rows, and today it deletes the
+# wrong ones.
+#
+# Measured 2026-10-15: of 98,416 listings, only 499 carry a
+# `category_path`, and HomeFeed filters on `whereNotNull('category_path')`
+# -- so those 499 are the entire browsable catalogue. 497 of them are
+# owned by load-test accounts, which is exactly what this CronJob
+# deletes. Running it now would leave the browse feed with TWO listings
+# and every capacity number after that would be measured against an
+# empty site.
+#
+# The prerequisite is the seeder giving the other 97,917 listings a
+# category_path. Once browse is populated from seeded data rather than
+# from load-test output, this becomes safe and then becomes REQUIRED --
+# without it a 24/7 soak grows the database without bound and the site
+# gets measurably slower every day.
+#
+# THE SOAK CANNOT RUN WITHOUT THIS.
+#
+# A test that ends can leave its rows behind and be purged by hand. A test
+# that runs day and night cannot: at 288 ads/day plus saves, enquiries and
+# yard sales, load-test rows grow without bound in the REAL database and
+# the site gets measurably slower every day as they accumulate. That is
+# not hypothetical -- it is one of the three reasons capacity has appeared
+# to fall ~25% overnight, run after run.
+#
+# `loadtest:purge --keep-accounts` deletes the generated content and keeps
+# the 200-account pool and the reference listing the personas target, so
+# tomorrow starts from the same row count as today. Steady state, not a
+# sawtooth.
+#
+# 04:00, an hour after the yard-sale prune at 03:00, so the two are never
+# deleting from the same tables at once.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: loadtest-purge-nightly
+  namespace: laravel-spa
+spec:
+  schedule: "0 4 * * *"
+  timeZone: "America/Chicago"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+            - name: ghcr-pull-secret
+          containers:
+            - name: loadtest-purge
+              image: ghcr.io/123xtd/laravel-spa-app:latest
+              command: ["php", "artisan", "loadtest:purge", "--keep-accounts"]
+              workingDir: /var/www/html
+              envFrom:
+                - secretRef:
+                    name: laravel-spa-secrets
+              resources: {}
+              securityContext:
+                allowPrivilegeEscalation: false
+                runAsNonRoot: true
+                runAsUser: 82
+                runAsGroup: 82
+                capabilities:
+                  drop: ["ALL"]
+                seccompProfile:
+                  type: RuntimeDefault

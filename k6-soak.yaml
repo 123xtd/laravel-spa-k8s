@@ -1,0 +1,400 @@
+# APPLYING THIS FILE IS SAFE. The nightly purge that a soak also needs
+# lives in k6-soak-purge-cronjob.yaml, separately and deliberately --
+# it deletes database rows, and right now it would delete 497 of the 499
+# listings that are browsable at all. Read that file before applying it.
+#
+# CONTINUOUS LOAD -- the rig that stays up.
+#
+# `k6-journey-job.yaml` runs a staircase and ends. That shape answers
+# "where is the knee" and cannot answer "is the site still fine at 09:00
+# tomorrow", which is the question that matters once the site is treated
+# as live. This runs the SAME script (it mounts the same ConfigMap,
+# `k6-journey-script`, with SOAK=true) at one held rate, indefinitely.
+#
+#   THE THROTTLE IS THE REPLICA COUNT, AND IT IS LIVE.
+#   Site-wide sessions/sec = SOAK_RATE x readers.  SOAK_RATE is 6:
+#
+#     kubectl -n laravel-spa scale statefulset/k6-soak-readers --replicas=8   #  48/s
+#     kubectl -n laravel-spa scale statefulset/k6-soak-readers --replicas=16  #  96/s
+#     kubectl -n laravel-spa scale statefulset/k6-soak-readers --replicas=20  # 120/s
+#     kubectl -n laravel-spa scale statefulset/k6-soak-readers --replicas=23  # 138/s
+#
+# No restart, no gap in the data, and a new generator is at its full rate
+# within seconds -- preAllocatedVUs is sized for the whole steady-state
+# demand in soak mode precisely so a replica added at 14:00 does not spend
+# two minutes growing into its rate while under-driving the site.
+#
+# ---------------------------------------------------------------------
+# WHY A StatefulSet AND NOT A Deployment
+#
+# Not for storage -- there is none. For NAMES. Every sample k6 pushes
+# carries `gen: $POD_NAME`, so that generators do not write the same
+# Prometheus series and lose all but one to duplicate-sample errors. A
+# Deployment invents a fresh random pod name on every scale event, so a
+# rig scaled twice a day for a month leaves Prometheus holding hundreds of
+# dead `gen` values, each a separate series for every k6 metric. A
+# StatefulSet reuses `k6-soak-readers-0..N` forever, so the label set is
+# bounded by the highest replica count ever used.
+#
+# `podManagementPolicy: Parallel` matters too: the default starts pods one
+# at a time and waits for each to be Ready, so scaling 8 -> 20 would take
+# minutes to reach the requested rate. Updates stay one-at-a-time in
+# reverse ordinal order, which is what you want for a script change.
+#
+# ---------------------------------------------------------------------
+# WHY READERS AND WRITERS ARE SEPARATE
+#
+# k6 arrival rates are INTEGERS and the write personas are rare. A
+# per-generator rate that rounds below one is floored UP to one per
+# window, so the rarest personas are inflated -- and the inflation is
+# proportional to the replica count. On a rig whose whole purpose is to be
+# scaled while running, that means scaling the readers would silently
+# change the WRITE load too, and no two hours of the soak would be
+# comparable. So writes come from exactly ONE pod at the true site-wide
+# rate, where there is nothing to divide and nothing to round.
+#
+# ---------------------------------------------------------------------
+# THE WRITE RATES HERE ARE REALISTIC -- A DELIBERATE BREAK WITH THE
+# STAIRCASE RUNS
+#
+# Every capacity number measured so far was taken with the poster persona
+# at ~0.32 ads/sec site-wide: 27,600 ads/day against a real expectation of
+# ~300, about 92x. That is not a detail. `CacheGuestPage::flush()` drops
+# EVERY cached page whenever ANY listing changes, and there is no lock
+# around regeneration -- so at an ad every 3 seconds the 300s TTL was
+# never once used, and the measured ~137 sessions/sec is a
+# permanently-stampeding ceiling.
+#
+# A soak meant to resemble a live site has to use the live write rate, so
+# RATE_POSTER below is ~288 ads/day. EXPECT THIS SOAK TO HOLD MORE THAN
+# 137/sec -- not because anything was fixed, but because the artificial
+# stampede is gone. The two numbers answer different questions:
+#
+#   staircase, 0.32 ads/s  ->  ~137 sessions/sec   "ceiling while stampeding"
+#   soak,      288 ads/day ->  ?                   "ceiling in normal operation"
+#
+# Keep both. The gap between them is the value of fixing the flush.
+#
+# ---------------------------------------------------------------------
+# MEMORY, AND A REPLICA CAP THAT IS NOT OPTIONAL
+#
+# loadgen has 15.47 GiB usable and these pods are BestEffort, so nothing
+# stops the kernel OOM-killing them. Per replica at SOAK_RATE=6:
+#
+#   steady state  120 VUs x 2.12 MB + 68 Mi fixed  =  ~325 MB
+#   degraded      216 VUs (maxVUs) x 2.12 MB + 68  =  ~526 MB
+#
+# "Degraded" is the case that binds, because that is exactly the state a
+# soak exists to catch: when the site slows, sessions stop completing and
+# k6 grows towards maxVUs to hold the rate.
+#
+#   20 replicas  ->  6.5 GB steady, 10.5 GB degraded   comfortable
+#   23 replicas  ->  7.5 GB steady, 12.1 GB degraded   the hard stop
+#
+# DO NOT EXCEED 23 READER REPLICAS on this box. Past that, a degrading
+# site takes the generators with it and the run reports the rig's memory
+# pressure as the site's latency -- a fabricated knee indistinguishable
+# from a real one. 23 x 6 = 138/sec, already past the measured ceiling, so
+# the cap costs nothing today. It binds once the flush is fixed; that is
+# when the DIMMs matter.
+#
+# ---------------------------------------------------------------------
+# CHANGING THINGS WHILE IT RUNS
+#
+#   1. edit the script in k6-journey-job.yaml   (one script, both rigs)
+#   2. kubectl apply -f k6-journey-job.yaml     (ConfigMap only)
+#   3. kubectl -n laravel-spa rollout restart statefulset/k6-soak-readers
+#
+# Step 3 replaces pods one at a time in reverse ordinal order, so the load
+# sags by one generator's worth (~4% at 23 replicas) and never stops. A
+# mounted ConfigMap does refresh in place within a minute or two, but k6
+# reads its script once at startup, so the restart is what applies it.
+---
+# Required by a StatefulSet and otherwise unused -- these pods serve
+# nothing and are never addressed by name. Headless, no cluster IP.
+apiVersion: v1
+kind: Service
+metadata:
+  name: k6-soak
+  namespace: laravel-spa
+  labels:
+    app: k6-soak
+spec:
+  clusterIP: None
+  selector:
+    app: k6-soak
+  ports:
+    - name: none
+      port: 9999
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: k6-soak-readers
+  namespace: laravel-spa
+  labels:
+    app: k6-soak
+    role: readers
+spec:
+  serviceName: k6-soak
+  # THE LIVE THROTTLE. 6 sessions/sec each, so this is 48/sec site-wide.
+  # Deliberately the low end: the staircase showed 48 and 90 comfortable,
+  # 132 the last good step, 174 a cliff. Start known-good, climb with
+  # `kubectl scale`, watch Grafana. Hard cap 23 -- see the arithmetic.
+  replicas: 8
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: k6-soak
+      role: readers
+  template:
+    metadata:
+      labels:
+        app: k6-soak
+        role: readers
+    spec:
+      # Scaling down should be quick -- k6 has nothing to flush, every
+      # sample has already gone to Prometheus.
+      terminationGracePeriodSeconds: 10
+      # The dedicated generator box, and nowhere else. A generator on a
+      # cluster node takes CPU from the site it is measuring.
+      nodeSelector:
+        workload: loadtest
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: loadtest
+          effect: NoSchedule
+      containers:
+        - name: k6
+          image: grafana/k6:latest
+          # No `exit 0` wrapper here, unlike the Job. There the exit code
+          # had to be discarded because k6 exits 99 on a crossed threshold
+          # and that failed the Job, deleting its siblings mid-summary. A
+          # StatefulSet pod has no siblings to take down, and a k6 that
+          # exits is something to SEE -- so let the code through and let
+          # the pod restart. CrashLoopBackOff is the signal; `exit 0`
+          # would hide it behind a pod that looks Running.
+          args: ["run", "/scripts/journey.js"]
+          env:
+            - name: GOMAXPROCS
+              value: "2"
+            - name: SOAK
+              value: "true"
+            # Sessions/sec PER REPLICA. Site-wide is this x replicas.
+            # Changing it needs a rollout; changing replicas does not.
+            - name: SOAK_RATE
+              value: "6"
+            - name: SOAK_ROLE
+              value: "readers"
+            # 30 days. k6 requires a duration -- there is no "forever" --
+            # so this is "long enough that the restart is a non-event".
+            # When it elapses the pod exits 0, the StatefulSet restarts
+            # it, and ~10 seconds of one generator is missing.
+            - name: SOAK_DURATION
+              value: "720h"
+            # Streams every 5s, so there is no end-of-run summary to wait
+            # for and nothing is lost when a pod dies. On a soak this is
+            # the ONLY output -- handleSummary never runs, because the pod
+            # never ends.
+            - name: K6_OUT
+              value: experimental-prometheus-rw
+            - name: K6_PROMETHEUS_RW_SERVER_URL
+              value: http://prometheus.monitoring.svc.cluster.local:9090/api/v1/write
+            - name: K6_PROMETHEUS_RW_TREND_AS_NATIVE_HISTOGRAM
+              value: "true"
+            - name: K6_PROMETHEUS_RW_PUSH_INTERVAL
+              value: 5s
+            - name: K6_PROMETHEUS_RW_STALE_MARKERS
+              value: "true"
+            # Stable across restarts and scale events, because this is a
+            # StatefulSet -- that is the whole reason it is one.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: TARGET_HOST
+              value: "www.foasfo.ca"
+            - name: LB_IP
+              value: "192.168.100.200"
+            - name: AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: loadtest-credentials
+                  key: BASIC_AUTH
+            - name: RECAPTCHA_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: loadtest-credentials
+                  key: RECAPTCHA_LOAD_TEST_TOKEN
+            - name: ACCOUNT_COUNT
+              value: "200"
+            - name: ACCOUNT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: loadtest-credentials
+                  key: ACCOUNT_PASSWORD
+            - name: KNOWN_LISTING
+              value: "100069"
+            - name: SUBCATEGORY_REQUESTS
+              value: "false"
+            - name: PHOTO_KB
+              value: "200"
+          # The namespace runs PodSecurity "restricted" in warn mode, and
+          # k6 needs none of what the profile forbids -- no root, no
+          # capabilities, no privilege escalation. Set explicitly so the
+          # rig stays clean if the namespace is ever moved to enforce.
+          # runAsUser is left to the image, which is already non-root.
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+          # Explicitly empty, and load-bearing: `kubectl apply` does not
+          # clear an omitted field, so a previously-applied request or
+          # limit would survive a file that stopped mentioning it.
+          resources: {}
+          # No requests, no limits -- by policy. Accepted trade-off: these
+          # are BestEffort, so under real memory pressure the kubelet
+          # evicts them first. On a dedicated generator box with nothing
+          # else to protect, that is the correct priority.
+      volumes:
+        - name: script
+          configMap:
+            # The SAME script the staircase job uses. One script, two
+            # rigs, no divergence to maintain.
+            name: k6-journey-script
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: k6-soak-writer
+  namespace: laravel-spa
+  labels:
+    app: k6-soak
+    role: writer
+spec:
+  serviceName: k6-soak
+  # ONE, and it must stay one. The rates below are site-wide absolutes;
+  # two writers would double the write load, and the rare personas would
+  # not even double cleanly because of the integer-rate floor.
+  replicas: 1
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: k6-soak
+      role: writer
+  template:
+    metadata:
+      labels:
+        app: k6-soak
+        role: writer
+    spec:
+      terminationGracePeriodSeconds: 10
+      nodeSelector:
+        workload: loadtest
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: loadtest
+          effect: NoSchedule
+      containers:
+        - name: k6
+          image: grafana/k6:latest
+          args: ["run", "/scripts/journey.js"]
+          env:
+            - name: GOMAXPROCS
+              value: "1"
+            - name: SOAK
+              value: "true"
+            - name: SOAK_ROLE
+              value: "writer"
+            - name: SOAK_DURATION
+              value: "720h"
+            # SITE-WIDE write rates, not per-generator, because there is
+            # exactly one of these pods.
+            #
+            # saver and enquirer are cheap and do not touch the page
+            # cache, so they stay at the rates the staircase used.
+            - name: RATE_SAVER
+              value: "2"
+            - name: RATE_ENQUIRER
+              value: "1"
+            # ~288 ads/day (the scenario floors to 2 per 10 minutes), the
+            # first realistic posting rate any run here has used. This is
+            # what makes the soak's ceiling incomparable to the
+            # staircase's 137/sec -- see the note at the top.
+            - name: RATE_POSTER
+              value: "0.00347"
+            # Floors to 1 per 10 minutes = 144/day, still above a
+            # realistic ~30/day. 10 minutes is the scenario's window and 1
+            # is the smallest integer it can hold, so this is the LOWEST
+            # yard-sale rate this script can express. Noted rather than
+            # hidden: yard sales also flush the page cache, so they
+            # contribute ~5x their share of real stampedes.
+            - name: RATE_YARDSALER
+              value: "0.000347"
+            - name: K6_OUT
+              value: experimental-prometheus-rw
+            - name: K6_PROMETHEUS_RW_SERVER_URL
+              value: http://prometheus.monitoring.svc.cluster.local:9090/api/v1/write
+            - name: K6_PROMETHEUS_RW_TREND_AS_NATIVE_HISTOGRAM
+              value: "true"
+            - name: K6_PROMETHEUS_RW_PUSH_INTERVAL
+              value: 5s
+            - name: K6_PROMETHEUS_RW_STALE_MARKERS
+              value: "true"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: TARGET_HOST
+              value: "www.foasfo.ca"
+            - name: LB_IP
+              value: "192.168.100.200"
+            - name: AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: loadtest-credentials
+                  key: BASIC_AUTH
+            - name: RECAPTCHA_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: loadtest-credentials
+                  key: RECAPTCHA_LOAD_TEST_TOKEN
+            - name: ACCOUNT_COUNT
+              value: "200"
+            - name: ACCOUNT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: loadtest-credentials
+                  key: ACCOUNT_PASSWORD
+            - name: KNOWN_LISTING
+              value: "100069"
+            - name: PHOTO_KB
+              value: "200"
+          # The namespace runs PodSecurity "restricted" in warn mode, and
+          # k6 needs none of what the profile forbids -- no root, no
+          # capabilities, no privilege escalation. Set explicitly so the
+          # rig stays clean if the namespace is ever moved to enforce.
+          # runAsUser is left to the image, which is already non-root.
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+          resources: {}
+      volumes:
+        - name: script
+          configMap:
+            name: k6-journey-script
