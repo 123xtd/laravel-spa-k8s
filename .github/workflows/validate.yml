@@ -1,0 +1,103 @@
+# A green check per push, and an honest one.
+#
+# This repo had no CI, so a push produced no visible signal anywhere --
+# unlike the app repo, whose build-and-push workflow gives a run to look
+# at. That silence is why "did my push land" kept needing a terminal.
+#
+# WHAT THIS CAN AND CANNOT CATCH, stated plainly so a green check is not
+# read as more than it is.
+#
+# CI has no access to the cluster, so every check here is offline:
+#
+#   caught    YAML that does not parse -- e.g. the stray `//` comment
+#             inside a YAML comment block that nearly broke
+#             k6-journey-job.yaml
+#   caught    misspelled or invented fields, wrong types, bad apiVersion
+#   caught    shell scripts that do not parse
+#   NOT       anything needing live state. The PVC failure
+#             (`storage: Forbidden: field can not be less than
+#             status.capacity`) was a server-side rejection and is
+#             invisible here. So is a Service selector pointing at pods
+#             that do not exist.
+#   NOT       drift between this repo and the cluster. Nothing offline
+#             can see that -- run `./drift-check.sh` from a machine with
+#             a kubeconfig.
+#
+# So: green means "these files are well-formed Kubernetes", not "the
+# cluster matches them" and not "this will apply cleanly".
+name: Validate manifests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    name: Manifests parse and match the Kubernetes schema
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # traefik-values.yaml is Helm input, not a manifest -- it has no
+      # kind or apiVersion and would fail schema validation for a reason
+      # that is not a problem.
+      - name: Build the manifest list
+        run: |
+          find . -name '*.yaml' -not -path './.github/*' \
+                 -not -name 'traefik-values.yaml' \
+            | sort | tee manifests.txt
+          echo "count=$(wc -l < manifests.txt)"
+
+      - name: Every file parses as YAML
+        run: |
+          python3 - <<'PY'
+          import sys, yaml
+          bad = []
+          for path in open("manifests.txt").read().split():
+              try:
+                  docs = list(yaml.safe_load_all(open(path, encoding="utf-8")))
+              except yaml.YAMLError as e:
+                  bad.append((path, str(e).splitlines()[0]))
+                  continue
+              # A manifest with no documents is almost always an editing
+              # accident, not an intentionally empty file.
+              if not [d for d in docs if d]:
+                  bad.append((path, "no YAML documents"))
+          for path, why in bad:
+              print(f"::error file={path}::{why}")
+          print(f"{len(bad)} file(s) failed to parse")
+          sys.exit(1 if bad else 0)
+          PY
+
+      - name: Shell scripts parse
+        run: |
+          rc=0
+          for f in $(find . -name '*.sh' -not -path './.github/*'); do
+            bash -n "$f" || { echo "::error file=$f::does not parse"; rc=1; }
+          done
+          exit $rc
+
+      # Schema validation. `latest` rather than a pinned version so this
+      # never breaks on a tag that stops existing; the download URL
+      # GitHub provides for `latest` always resolves.
+      - name: Install kubeconform
+        run: |
+          curl -sSfL \
+            https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz \
+            | tar -xz kubeconform
+          ./kubeconform -v
+
+      # -ignore-missing-schemas is required, not laziness: this cluster
+      # runs CRDs (MetalLB IPAddressPool, cert-manager ClusterIssuer,
+      # Traefik middlewares) whose schemas are not in the upstream
+      # catalogue. Without it every one of those is a false failure.
+      # Core Kubernetes kinds are still checked strictly.
+      - name: Manifests match the Kubernetes schema
+        run: |
+          ./kubeconform \
+            -strict \
+            -ignore-missing-schemas \
+            -summary \
+            -output tap \
+            $(cat manifests.txt)
