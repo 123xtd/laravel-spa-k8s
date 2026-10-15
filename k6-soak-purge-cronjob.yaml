@@ -53,7 +53,28 @@ spec:
           containers:
             - name: loadtest-purge
               image: ghcr.io/123xtd/laravel-spa-app:latest
-              command: ["php", "artisan", "loadtest:purge", "--keep-accounts"]
+              # THE CACHE FLUSH IS NOT OPTIONAL, and it is not in the
+              # purge command itself.
+              #
+              # Every delete in PurgeLoadTestData is a query-builder mass
+              # delete (whereIn(...)->delete()), which does NOT fire
+              # Eloquent model events -- so HomeFeedInvalidator never
+              # runs and nothing clears the cached feed. The cached feed
+              # holds precisely the listings this job deletes, so without
+              # the flush browse serves deleted listings, with dead
+              # detail links, for up to the 900s TTL.
+              #
+              # cache:clear flushes the cache store only (Redis db3).
+              # Sessions live in db2 under the session driver, so nobody
+              # is logged out.
+              #
+              # The proper fix is for the command to flush its own caches
+              # the way listings:backfill-category-paths does; that needs
+              # an app deploy, this does not.
+              command:
+                - sh
+                - -c
+                - php artisan loadtest:purge --keep-accounts && php artisan cache:clear
               workingDir: /var/www/html
               envFrom:
                 - secretRef:
