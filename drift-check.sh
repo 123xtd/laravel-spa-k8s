@@ -57,6 +57,18 @@ for f in $(ls *.yaml monitoring/*.yaml 2>/dev/null | grep -Ev "$SKIP"); do
   rc=$?
   if [ $rc -eq 0 ]; then
     say "  same    $f"
+  elif [ "$(echo "$out" | grep -cE '^-[^-]')" -eq 0 ]; then
+    # Every line is an addition and nothing is being removed, which means
+    # the object does not exist in the cluster at all -- `kubectl diff`
+    # renders that as a whole-object insert rather than an error, so it
+    # cannot be detected by matching "not found".
+    #
+    # This distinction is the difference between a check that gets read
+    # and one that gets ignored: a deliberately unapplied file (k6-soak,
+    # the purge CronJob) is NOT drift, and reporting it as drift would
+    # make every run end in "NOT SAFE" until someone stopped looking.
+    MISSING+=("$f")
+    say "  ABSENT  $f  (not applied -- deliberate, or not applied yet)"
   elif echo "$out" | grep -q "not found\|NotFound\|doesn't have a resource type"; then
     # Objects in the file that do not exist in the cluster at all. Normal
     # for one-shot Jobs that have been deleted; a problem for anything
