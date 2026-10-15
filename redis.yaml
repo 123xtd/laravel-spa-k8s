@@ -9,7 +9,14 @@ metadata:
   name: redis
   namespace: laravel-spa
 spec:
-  replicas: 1
+  # ZERO, not deleted. Dragonfly replaced this on 2026-10-15 (see
+  # dragonfly.yaml for why). The Deployment is kept at zero so rollback
+  # is `replicas: 1` plus pointing the Service selector below back at
+  # `app: redis` -- no manifest archaeology at the moment it is needed.
+  #
+  # Deleting this block is the right move once Dragonfly has held a full
+  # soak without incident.
+  replicas: 0
   selector:
     matchLabels:
       app: redis
@@ -28,26 +35,49 @@ spec:
           # settings lived only in the pod's `args`. Declaring them here
           # means the manifest is now the whole truth.
           #
-          # maxmemory is over-provisioned rather than tuned: at the ceiling
-          # (160 arrivals/sec) Redis held 762 MB, of which 739 MB was
-          # per-client I/O buffers for a 640 KB page-cache value served to
-          # 9,160 clients. maxmemory accounting includes those buffers, so
-          # the headroom has to cover them, not just the data -- there were
-          # only 468 actual keys.
+          # NO MEMORY CAP. `--maxmemory 0` means unlimited, by explicit
+          # instruction: nothing in this cluster is capped, and if a
+          # component cannot work on those terms it gets replaced rather
+          # than fenced.
           #
-          # Snapshots are off: a fork at this size transiently doubles RSS,
-          # which is the one thing that could still OOM the pod. Nothing
-          # here needs to survive a restart -- allkeys-lru already discards
-          # sessions under pressure (259,425 keys evicted in one run), so
-          # durability was never a property this store had.
+          # What this changes, so it is not a surprise later. Redis
+          # previously ran with maxmemory 8gb and allkeys-lru, which made
+          # memory pressure a GRADUAL failure: the coldest cached pages
+          # were evicted and the site kept serving from a smaller cache
+          # (259,425 keys were evicted in one run, invisibly to users).
+          # Uncapped, there is nothing to evict against, so pressure
+          # becomes an ABRUPT failure -- Redis grows until the kernel
+          # OOM-kills it on k27 and the entire cache disappears at once,
+          # along with every session held in it.
+          #
+          # How much room that is: at 160 arrivals/sec Redis held 762 MB,
+          # and only 23 MB of that was data -- 739 MB was per-client I/O
+          # buffers for a 640 KB page value served to 9,160 clients
+          # concurrently. There were 468 actual keys. So consumption
+          # tracks CONCURRENT CLIENTS, not stored data, and it scales
+          # with arrival rate. k27 has 32 GB, which at that ratio is
+          # roughly 6,700 arrivals/sec before the node is gone.
+          #
+          # allkeys-lru is retained deliberately even though maxmemory is
+          # 0. The policy is inert at 0, but it means that if a memory
+          # cap is ever reintroduced the behaviour returns to eviction
+          # rather than to refusing writes.
+          #
+          # maxclients is likewise raised past any practical limit. The
+          # real ceiling becomes the process file-descriptor limit, which
+          # is the kernel's number rather than one chosen here.
+          #
+          # Snapshots stay off: a fork at this size transiently doubles
+          # RSS, which with no cap is now the fastest route to OOM.
+          # Nothing here needs to survive a restart.
           command:
             - redis-server
             - --maxmemory
-            - "8gb"
+            - "0"
             - --maxmemory-policy
             - allkeys-lru
             - --maxclients
-            - "50000"
+            - "1000000"
             - --save
             - ""
             - --appendonly
@@ -105,8 +135,15 @@ metadata:
   name: redis
   namespace: laravel-spa
 spec:
+  # STILL NAMED `redis`, NOW POINTING AT DRAGONFLY.
+  #
+  # 48 app pods carry REDIS_HOST=redis from the secret, so renaming this
+  # Service would mean editing a secret and restarting the whole fleet to
+  # gain nothing -- Dragonfly speaks the Redis protocol. This one
+  # selector is the entire cutover, and flipping it back to `app: redis`
+  # (plus replicas: 1 above) is the entire rollback. See dragonfly.yaml.
   selector:
-    app: redis
+    app: dragonfly
   ports:
     - port: 6379
       targetPort: 6379

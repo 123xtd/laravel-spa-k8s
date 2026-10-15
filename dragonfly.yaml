@@ -1,0 +1,102 @@
+# Dragonfly, replacing Redis as the cache and session store.
+#
+# WHY, and it is not throughput. Redis was measured at 0.27 of one core
+# and a 2.7 MB dataset across 21 keys on 2026-10-15 -- it is nowhere near
+# a capacity limit, and nobody should expect this swap to move the
+# ~137 sessions/sec ceiling. Two things make it worth doing anyway:
+#
+# 1. CONNECTIONS. 4,347 client connections sat idle at 48 app pods, and
+#    their buffers cost 12.6 MB -- 4.7x the entire dataset. The HPA
+#    permits 200 app pods, which at ~82 FPM children each is ~16,400
+#    connections. A single-threaded Redis spends real time just servicing
+#    that many connection buffers; Dragonfly is multi-threaded and shards
+#    connections across cores. This is the actual reason.
+#
+# 2. THE maxmemory CLIFF. Redis refuses writes issued from inside a Lua
+#    script while over maxmemory, because it cannot guarantee eviction
+#    mid-script. `Cache::add()` is a Lua script and is called on every
+#    page view, so hitting the cap did not degrade the site, it 500'd it.
+#    `--cache_mode=true` below is the fix: Dragonfly evicts to stay under
+#    its limit instead of failing writes.
+#
+# THE SERVICE IS STILL CALLED `redis`, DELIBERATELY. 48 app pods carry
+# REDIS_HOST=redis from the secret; renaming it would mean a secret edit
+# and a full fleet restart for no benefit. The Service stays in
+# redis.yaml, and its selector is what performs the cutover -- see the
+# note there. Dragonfly speaks the Redis protocol, so nothing in the
+# application changes.
+#
+# ROLLBACK: point the `redis` Service selector back at `app: redis` and
+# scale the redis Deployment to 1. Both live in redis.yaml.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dragonfly
+  namespace: laravel-spa
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dragonfly
+  template:
+    metadata:
+      labels:
+        app: dragonfly
+    spec:
+      containers:
+        - name: dragonfly
+          # ghcr rather than docker.dragonflydb.io because this cluster
+          # already pulls from ghcr.io and that path is known to work.
+          #
+          # PINNED BY DIGEST, not by tag. This resolved from `latest` on
+          # 2026-10-15 and reported `df-v2.0.2`. A floating tag on the
+          # datastore is precisely the "it worked last night and it is
+          # 25% slower today" failure this cluster keeps producing -- an
+          # overnight registry push would change the component under the
+          # measurement with nothing in the manifest to show it. A digest
+          # cannot move. To upgrade deliberately: pull the new tag, read
+          # its digest, put it here, apply.
+          image: ghcr.io/dragonflydb/dragonfly@sha256:061f00b201b58e12f974e4e96c761a881ee1c05e9d8ee967466a604b7299753b
+          args:
+            - --logtostderr
+            - --port=6379
+            # Evict rather than refuse writes when memory runs short.
+            # This is the single most important flag here: it is the
+            # behaviour whose absence in Redis turned a memory ceiling
+            # into site-wide 500s.
+            - --cache_mode=true
+            # The app uses TWO databases -- REDIS_DB and REDIS_CACHE_DB,
+            # currently db2 and db3. Dragonfly defaults to 16, set
+            # explicitly so a future default change cannot silently take
+            # the session store away.
+            - --dbnum=16
+            # No snapshots, matching Redis's `--save "" --appendonly no`.
+            # This is a cache and a session store; losing it on restart
+            # logs people out and costs one cold cache, which is cheaper
+            # than paying for durability that is never read.
+            - --dbfilename=
+            # No maxmemory on purpose. A cap has to be guessed in
+            # advance, and every guess made in this cluster was wrong for
+            # the next traffic shape. Unset, Dragonfly sizes itself from
+            # the node and `cache_mode` keeps it under that by evicting.
+          ports:
+            - containerPort: 6379
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            # The image's own `dfly` user.
+            runAsUser: 1000
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          readinessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 2
+          livenessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 5
+          # No requests, no limits -- by policy. See app-clone.yaml.
+          resources: {}
