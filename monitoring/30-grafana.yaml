@@ -52,6 +52,632 @@ metadata:
   name: grafana-dashboard-capacity
   namespace: monitoring
 data:
+  # A second dashboard in the same ConfigMap. The file provider reads
+  # every file in /etc/grafana/dashboards, so this needs no change to the
+  # Deployment and no restart -- Grafana polls the directory and the
+  # kubelet refreshes a mounted ConfigMap within about a minute.
+  #
+  # Separate from capacity.json on purpose: that one answers "what is the
+  # cluster doing", this one answers "what did this load test find", and
+  # they are read at different times by different questions.
+  journey-load-test.json: |
+    {
+      "title": "Load test: journey run",
+      "uid": "journey",
+      "timezone": "browser",
+      "refresh": "10s",
+      "time": {
+        "from": "now-45m",
+        "to": "now"
+      },
+      "panels": [
+        {
+          "type": "stat",
+          "title": "Generators reporting (no fixed target -- the rig is scaled by replica count)",
+          "description": "Should be 12. Fewer means one was killed -- above 216 arrivals/sec expect exactly that, and it is the rig failing, not the site. Metrics already pushed are safe either way.",
+          "gridPos": {
+            "h": 4,
+            "w": 6,
+            "x": 0,
+            "y": 0
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "decimals": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "#d03b3b",
+                    "value": null
+                  },
+                  {
+                    "color": "#fab219",
+                    "value": 1
+                  },
+                  {
+                    "color": "#0ca30c",
+                    "value": 2
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              }
+            }
+          },
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "textMode": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ]
+            }
+          },
+          "targets": [
+            {
+              "expr": "count(count by (gen) (k6_vus))"
+            }
+          ]
+        },
+        {
+          "type": "stat",
+          "title": "Sessions completed /sec",
+          "description": "Compare against the step being held: 48, 90, 132, 174, 216, 258, 300. Where this stops tracking the offered rate, something has run out.",
+          "gridPos": {
+            "h": 4,
+            "w": 6,
+            "x": 6,
+            "y": 0
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "decimals": 1,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "text",
+                    "value": null
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              }
+            }
+          },
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "textMode": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ]
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum(rate(k6_iterations_total[1m]))"
+            }
+          ]
+        },
+        {
+          "type": "stat",
+          "title": "Sessions dropped /sec",
+          "description": "k6 abandoning scheduled work because it has no VU free. Sustained above zero means the offered rate is not actually being applied.",
+          "gridPos": {
+            "h": 4,
+            "w": 6,
+            "x": 12,
+            "y": 0
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "decimals": 1,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "#0ca30c",
+                    "value": null
+                  },
+                  {
+                    "color": "#fab219",
+                    "value": 0.5
+                  },
+                  {
+                    "color": "#d03b3b",
+                    "value": 5
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              }
+            }
+          },
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "textMode": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ]
+            }
+          },
+          "targets": [
+            {
+              "expr": "(sum(rate(k6_dropped_iterations_total[1m])) or vector(0))"
+            }
+          ]
+        },
+        {
+          "type": "stat",
+          "title": "Requests failing",
+          "description": "Note what the 2026-10-15 run found: requests SUCCEEDED while taking ten seconds. A flat line here is not evidence of health -- read the latency panel for that.",
+          "gridPos": {
+            "h": 4,
+            "w": 6,
+            "x": 18,
+            "y": 0
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "decimals": 2,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "#0ca30c",
+                    "value": null
+                  },
+                  {
+                    "color": "#fab219",
+                    "value": 0.01
+                  },
+                  {
+                    "color": "#d03b3b",
+                    "value": 0.05
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              }
+            }
+          },
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "textMode": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ]
+            }
+          },
+          "targets": [
+            {
+              "expr": "(sum(rate(k6_http_reqs_total{expected_response=\"false\"}[1m])) or vector(0)) / clamp_min(sum(rate(k6_http_reqs_total[1m])), 0.001)"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "p95 latency by journey step, all generators together",
+          "description": "The twelve generators push native histograms, which are additive -- so summing them and then taking the quantile is the real site-wide p95, not an average of twelve separate p95s (which would mean nothing). The home page is the one to watch: on 2026-10-15 it was bimodal, 140ms median against a 10.79s p95, because publishing an ad flushes the whole page cache and every request in the next three seconds regenerates it.",
+          "gridPos": {
+            "h": 9,
+            "w": 12,
+            "x": 0,
+            "y": 4
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "min": 0,
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never"
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "home"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#3987e5"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "listings index"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#d95926"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "listing detail"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#199e70"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "search"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#c98500"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "max",
+                "lastNotNull"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.95, sum(rate(k6_step_home_seconds[1m])))",
+              "legendFormat": "home"
+            },
+            {
+              "expr": "histogram_quantile(0.95, sum(rate(k6_step_listings_index_seconds[1m])))",
+              "legendFormat": "listings index"
+            },
+            {
+              "expr": "histogram_quantile(0.95, sum(rate(k6_step_listing_detail_seconds[1m])))",
+              "legendFormat": "listing detail"
+            },
+            {
+              "expr": "histogram_quantile(0.95, sum(rate(k6_step_search_seconds[1m])))",
+              "legendFormat": "search"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Sessions per second: offered, completed, dropped",
+          "description": "All three in the same unit on one axis, deliberately. Offered is what the staircase asked for (completed + dropped, since k6 drops what it cannot start). When completed falls away from offered, read the generator memory panel before blaming the site.",
+          "gridPos": {
+            "h": 9,
+            "w": 12,
+            "x": 12,
+            "y": 4
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "min": 0,
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never"
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "offered"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#c98500"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "completed"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#3987e5"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "dropped"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#d95926"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "max",
+                "lastNotNull"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum(rate(k6_iterations_total[1m])) + (sum(rate(k6_dropped_iterations_total[1m])) or vector(0))",
+              "legendFormat": "offered"
+            },
+            {
+              "expr": "sum(rate(k6_iterations_total[1m]))",
+              "legendFormat": "completed"
+            },
+            {
+              "expr": "(sum(rate(k6_dropped_iterations_total[1m])) or vector(0))",
+              "legendFormat": "dropped"
+            }
+          ]
+        },
+        {
+          "type": "barchart",
+          "title": "Home page p95 by staircase step  (this is the knee)",
+          "description": "One bar per held step, which is the whole reason the run is tagged: the 2026-10-15 run could only say the knee was 'somewhere between 48 and 192 arrivals/sec'. Steps are labelled s<n>_<site-wide arrivals/sec>. `ramp` is the transitions and belongs to no step; `tail` is the write personas outliving the staircase. Use a run-length time range for this one.",
+          "gridPos": {
+            "h": 9,
+            "w": 12,
+            "x": 0,
+            "y": 13
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "min": 0,
+              "color": {
+                "mode": "fixed",
+                "fixedColor": "#3987e5"
+              },
+              "custom": {
+                "fillOpacity": 85,
+                "lineWidth": 0,
+                "axisLabel": "p95"
+              }
+            }
+          },
+          "options": {
+            "xTickLabelRotation": 0,
+            "showValue": "always",
+            "legend": {
+              "showLegend": false
+            },
+            "tooltip": {
+              "mode": "single"
+            }
+          },
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.95, sum by (stair) (rate(k6_step_home_seconds[$__range])))",
+              "legendFormat": "{{stair}}",
+              "instant": true,
+              "format": "table"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Generator memory  (the rig's own ceiling, ~13.5 GB usable)",
+          "description": "The honest test of who is slow. Latency rising while this climbs towards the line is the GENERATOR stalling -- k6 starts its request timer when a request is queued, so its own memory pressure is recorded as server latency. Latency rising while this is flat is the site. A visitor costs 2.12 MB here, which is why 300 arrivals/sec is past what 16 GB can generate.",
+          "gridPos": {
+            "h": 9,
+            "w": 12,
+            "x": 12,
+            "y": 13
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "min": 0,
+              "color": {
+                "mode": "fixed",
+                "fixedColor": "#199e70"
+              },
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "thresholdsStyle": {
+                  "mode": "line"
+                }
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "transparent",
+                    "value": null
+                  },
+                  {
+                    "color": "#d03b3b",
+                    "value": 14495514624
+                  }
+                ]
+              }
+            }
+          },
+          "options": {
+            "legend": {
+              "showLegend": false
+            },
+            "tooltip": {
+              "mode": "single"
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum(container_memory_working_set_bytes{namespace=\"laravel-spa\",pod=~\"k6-(journey|soak).*\"})",
+              "legendFormat": "all generators"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "App replicas during the run  (and why this panel is a trap)",
+          "description": "On 2026-10-15 the home page's p95 reached 10.79s while this sat at 24 for the entire run. Both HPAs scale on CPU, and CPU-based autoscaling is structurally blind to an I/O stall: the pods were waiting on Redis, not burning CPU, so the autoscaler saw an idle fleet and correctly concluded nothing was needed. Judge the run by latency; this panel only says whether scaling was even attempted.\n\nNote exported_namespace, not namespace: the pod scrape overwrites the namespace label with kube-state-metrics' own.",
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 22
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "min": 0,
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never"
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "app-clone: current"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#3987e5"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "app-clone: ceiling"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#d95926"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "traefik: current"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#199e70"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "expr": "kube_horizontalpodautoscaler_status_current_replicas{exported_namespace=\"laravel-spa\"}",
+              "legendFormat": "app-clone: current"
+            },
+            {
+              "expr": "kube_horizontalpodautoscaler_spec_max_replicas{exported_namespace=\"laravel-spa\"}",
+              "legendFormat": "app-clone: ceiling"
+            },
+            {
+              "expr": "kube_horizontalpodautoscaler_status_current_replicas{exported_namespace=\"traefik-system\"}",
+              "legendFormat": "traefik: current"
+            }
+          ]
+        }
+      ]
+    }
   capacity.json: |
     {
       "title": "Capacity & Bottlenecks",
@@ -164,6 +790,21 @@ metadata:
 spec:
   accessModes: ["ReadWriteOnce"]
   storageClassName: longhorn
+  # A PVC's `storage` request is the SIZE OF THE DISK, not a reservation of
+  # anything shared -- so the no-requests-no-limits policy (which is about
+  # CPU and memory) does not apply to it. Omitting it does not mean
+  # "uncapped"; it means the manifest is rejected outright:
+  #
+  #   spec.resources.requests.storage: Forbidden: field can not be less
+  #   than status.capacity
+  #
+  # which is why this whole file silently would not apply. The live volume
+  # is 2Gi. Same correction as in 10-prometheus.yaml.
+  resources:
+    requests:
+      storage: 2Gi
+  # The policy note below is kept because it is still true of this
+  # Deployment's containers, which have neither requests nor limits.
   # No requests, no limits -- by policy.
   #
   # A request RESERVES capacity whether or not it is used, and the
