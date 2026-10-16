@@ -15,9 +15,12 @@
 #   Site-wide sessions/sec = SOAK_RATE x readers.  SOAK_RATE is 6:
 #
 #     kubectl -n laravel-spa scale statefulset/k6-soak-readers --replicas=8   #  48/s
-#     kubectl -n laravel-spa scale statefulset/k6-soak-readers --replicas=16  #  96/s
-#     kubectl -n laravel-spa scale statefulset/k6-soak-readers --replicas=20  # 120/s
-#     kubectl -n laravel-spa scale statefulset/k6-soak-readers --replicas=23  # 138/s
+#     kubectl -n laravel-spa scale statefulset/k6-soak-readers --replicas=10  #  60/s
+#     kubectl -n laravel-spa scale statefulset/k6-soak-readers --replicas=12  #  72/s  <- the cap
+#
+# 12 is the hard stop on this box, not a round number -- see the memory
+# arithmetic below. It was 23 until the first soak measured what a
+# session really costs.
 #
 # No restart, no gap in the data, and a new generator is at its full rate
 # within seconds -- preAllocatedVUs is sized for the whole steady-state
@@ -81,22 +84,36 @@
 # loadgen has 15.47 GiB usable and these pods are BestEffort, so nothing
 # stops the kernel OOM-killing them. Per replica at SOAK_RATE=6:
 #
-#   steady state  120 VUs x 2.12 MB + 68 Mi fixed  =  ~325 MB
-#   degraded      216 VUs (maxVUs) x 2.12 MB + 68  =  ~526 MB
+#   steady state  249 VUs x 2.12 MB + 68 Mi fixed  =  ~596 MB
+#   degraded      459 VUs (maxVUs) x 2.12 MB + 68  =  ~1,041 MB
+#
+# REVISED 2026-10-16, and the revision roughly halves the cap. The first
+# soak measured what a session actually costs: scroller's mean is 56.6s,
+# not the ~36s the old uniform VU multiplier assumed, so each generator
+# now carries 249 VUs steady instead of 120. Every dropped iteration in
+# that first run was scroller starving for a VU.
 #
 # "Degraded" is the case that binds, because that is exactly the state a
-# soak exists to catch: when the site slows, sessions stop completing and
-# k6 grows towards maxVUs to hold the rate.
+# soak is there to catch: when the site slows, sessions stop completing
+# and k6 grows towards maxVUs to hold the rate.
 #
-#   20 replicas  ->  6.5 GB steady, 10.5 GB degraded   comfortable
-#   23 replicas  ->  7.5 GB steady, 12.1 GB degraded   the hard stop
+# Readers get ~12.6 GB of the ~14 GB usable, because the writer's 640
+# maxVUs can reach ~1.4 GB:
 #
-# DO NOT EXCEED 23 READER REPLICAS on this box. Past that, a degrading
-# site takes the generators with it and the run reports the rig's memory
+#   12 replicas  ->  7.2 GB steady, 12.5 GB degraded   the hard stop
+#   20 replicas  ->  11.9 GB steady, 20.8 GB degraded  OOMs when it matters
+#
+# DO NOT EXCEED 12 READER REPLICAS on this box. Past that a degrading site
+# takes the generators with it and the run reports the rig's memory
 # pressure as the site's latency -- a fabricated knee indistinguishable
-# from a real one. 23 x 6 = 138/sec, already past the measured ceiling, so
-# the cap costs nothing today. It binds once the flush is fixed; that is
-# when the DIMMs matter.
+# from a real one.
+#
+# 12 x 6 = 72 sessions/sec, and that is now BELOW the site's measured
+# ~137/sec. So unlike the staircase era, the rig can no longer reach the
+# site's ceiling: to drive past ~72/sec this box needs the DIMMs. That
+# reverses the earlier "not needed yet" conclusion, which was drawn from
+# a run that was itself dropping 78,019 iterations and therefore never
+# offering what it claimed.
 #
 # ---------------------------------------------------------------------
 # CHANGING THINGS WHILE IT RUNS
@@ -140,7 +157,7 @@ spec:
   # THE LIVE THROTTLE. 6 sessions/sec each, so this is 48/sec site-wide.
   # Deliberately the low end: the staircase showed 48 and 90 comfortable,
   # 132 the last good step, 174 a cliff. Start known-good, climb with
-  # `kubectl scale`, watch Grafana. Hard cap 23 -- see the arithmetic.
+  # `kubectl scale`, watch Grafana. Hard cap 12 -- see the arithmetic.
   replicas: 8
   podManagementPolicy: Parallel
   selector:

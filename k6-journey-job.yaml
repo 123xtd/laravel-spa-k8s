@@ -183,6 +183,17 @@ data:
     const SOAK_RATE = parseFloat(__ENV.SOAK_RATE || '6');
     const SOAK_DURATION = __ENV.SOAK_DURATION || '720h';
     const SOAK_ROLE = __ENV.SOAK_ROLE || 'both';
+    // Mean session seconds per read persona, MEASURED 2026-10-16 on the
+    // first soak. Override to re-tune without editing the script:
+    // SESSION_SCROLLER=57 etc. Re-measure with
+    //   histogram_avg(sum by (scenario) (rate(k6_iteration_duration_seconds[10m])))
+    // after any change to think times, or the VU budget silently stops
+    // matching the traffic.
+    const SESSION_SECONDS = {
+      scroller: parseFloat(__ENV.SESSION_SCROLLER || '57'),
+      searcher: parseFloat(__ENV.SESSION_SEARCHER || '12'),
+      checker: parseFloat(__ENV.SESSION_CHECKER || '3'),
+    };
 
     const CEIL = SOAK ? SOAK_RATE : (STAIRS ? Math.max.apply(null, STEPS) : PEAK);
 
@@ -314,14 +325,40 @@ data:
       // site-wide figure is wrong for as long as it takes to grow, and
       // k6 drops scheduled iterations while growing.
       if (SOAK) {
+        // VU SIZING IS PER PERSONA, because session length is.
+        //
+        // This used to apply one multiplier (20 pre, 36 max) to every
+        // read persona, which assumes they all take about the same time.
+        // They do not, and the first soak proved it: every dropped
+        // iteration was `scroller` and no other scenario dropped at all.
+        //
+        // Measured over 10 minutes at 48 sessions/sec (MEAN duration,
+        // which is what Little's Law takes -- concurrent = rate x mean):
+        //
+        //   scroller   56.6s   "bored, killing time, long think times"
+        //   searcher   11.9s
+        //   checker     2.3s
+        //
+        // So scroller needed 3.30/s x 56.6s = 187 VUs per generator and
+        // had 119. It dropped 9.7 sessions/sec, which was the ENTIRE
+        // shortfall between offered and completed -- the site was fine
+        // (home p95 103 ms, zero failures) and the generator simply had
+        // no VU free to start the iteration on.
+        //
+        // 1.1x the mean pre-allocated, 1.8x for the ceiling: a session's
+        // length varies (scroller's p95 is 101s against a 56.6s mean),
+        // and an arrival-rate executor with no free VU does not wait, it
+        // DROPS -- silently, and the result looks like a server that
+        // cannot keep up.
+        const seconds = SESSION_SECONDS[exec] || 36;
         return {
           executor: 'constant-arrival-rate',
           exec,
           timeUnit: `${READ_UNIT_S}s`,
           rate: perUnit(SOAK_RATE * weight),
           duration: SOAK_DURATION,
-          preAllocatedVUs: Math.max(20, Math.round(SOAK_RATE * weight * 20)),
-          maxVUs: Math.max(60, Math.round(SOAK_RATE * weight * 36)),
+          preAllocatedVUs: Math.max(20, Math.round(SOAK_RATE * weight * seconds * 1.1)),
+          maxVUs: Math.max(60, Math.round(SOAK_RATE * weight * seconds * 1.8)),
         };
       }
       return {
