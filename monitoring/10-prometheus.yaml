@@ -205,24 +205,27 @@ metadata:
 spec:
   accessModes: ["ReadWriteOnce"]
   storageClassName: longhorn
-  # No requests, no limits -- by policy.
+  # THE ONE REQUEST IN THIS REPOSITORY, AND WHY IT IS NOT AN EXCEPTION.
   #
-  # A request RESERVES capacity whether or not it is used, and the
-  # scheduler places pods on reservations rather than reality. That is
-  # what made this cluster look 79% full while it was 35% used, so
-  # nothing could be placed and "least loaded node" was decided from
-  # fiction. A limit is a ceiling that has to be guessed in advance,
-  # and every guess made here was wrong for the next traffic shape --
-  # it OOMKilled the ingress twice.
+  # The no-requests-no-limits policy is about CPU and memory, where a
+  # request reserves a share of a node whether or not it is used -- which
+  # is what made this cluster look 79% full while it was 35% used.
   #
-  # So: nothing is reserved and nothing is capped. Every pod may take
-  # whatever the node has free, and scaling decisions belong to
-  # Kubernetes (see the HorizontalPodAutoscalers) rather than to
-  # hand-picked numbers.
+  # A PersistentVolumeClaim's `storage` request is a different thing
+  # wearing the same word: it is the SIZE OF THE DISK to create, not a
+  # claim on anything shared. Longhorn has nothing to provision without
+  # it, and because a bound PVC's size cannot be reduced, a manifest that
+  # omits it does not express "uncapped" -- it is simply rejected:
   #
-  # The accepted trade-off: with no requests every pod is BestEffort
-  # QoS, so under genuine node memory pressure the kubelet evicts
-  # these first and the kernel may OOM-kill them. That is deliberate.
+  #   spec.resources.requests.storage: Forbidden: field can not be less
+  #   than status.capacity
+  #
+  # So the whole file failed to apply, silently, until something needed
+  # changing in it. The live volume is 10Gi; this records that rather
+  # than contradicting it.
+  resources:
+    requests:
+      storage: 10Gi
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -257,7 +260,50 @@ spec:
             - --config.file=/etc/prometheus/prometheus.yml
             - --storage.tsdb.path=/prometheus
             - --storage.tsdb.retention.time=15d
+            # SIZE CAP AS A BACKSTOP, added 2026-10-16 before an
+            # unattended multi-day soak.
+            #
+            # Time-based retention alone does not protect the disk: if the
+            # volume fills before 15 days elapse, Prometheus stops
+            # ingesting and the run's data stops at that moment -- which
+            # is precisely the data the run exists to produce. At 12
+            # generators it writes ~1.1 GB/day against a 9.7 GB volume;
+            # at 20 it is closer to 1.7 GB/day, and a long weekend plus
+            # the existing 3.1 GB gets close enough to matter.
+            #
+            # 8GB leaves headroom on the volume and makes Prometheus drop
+            # the OLDEST blocks rather than die. Losing last week is
+            # recoverable; losing this weekend is not.
+            - --storage.tsdb.retention.size=8GB
             - --web.enable-lifecycle
+            # PUSH, not scrape, and only for the load generators.
+            #
+            # Everything else here is scraped, which is the right default:
+            # a target that dies stops answering, and its absence is
+            # itself the signal. A load generator is the one thing that
+            # cannot work that way. It lives for twenty-five minutes, it
+            # is EXPECTED to be killed at the top of a staircase, and its
+            # results existed only inside its own process -- so when the
+            # 2026-10-15 run's generators went, the run's numbers went
+            # with them.
+            #
+            # k6 pushes every 5 seconds, so a generator that dies now
+            # loses at most five seconds and every step below the break
+            # survives in here.
+            #
+            # The endpoint (/api/v1/write) accepts anything that can reach
+            # it, which is why the Service stays ClusterIP: in-cluster
+            # only, viewed through Grafana, which has a login. Do not give
+            # this a LoadBalancer address without putting auth in front.
+            - --web.enable-remote-write-receiver
+            # Native histograms, which is what makes twelve generators'
+            # latencies ADDABLE. A p95 reported per generator cannot be
+            # averaged across twelve of them -- that is why the merge
+            # script settles for the median of twelve estimates. A
+            # histogram is additive by construction, so summing the twelve
+            # and then taking the quantile is the real figure rather than
+            # an approximation of it.
+            - --enable-feature=native-histograms
           ports:
             - name: web
               containerPort: 9090
