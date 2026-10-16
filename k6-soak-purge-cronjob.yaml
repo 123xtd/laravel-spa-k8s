@@ -29,15 +29,23 @@
 # tomorrow starts from the same row count as today. Steady state, not a
 # sawtooth.
 #
-# 04:00, an hour after the yard-sale prune at 03:00, so the two are never
-# deleting from the same tables at once.
+# 05:00, NOT 04:00. The original 04:00 collided with database-backup,
+# which also runs at 04:00 America/Chicago -- so on 2026-10-16 the backup
+# ran while this job was deleting ~500 listings, and would have captured
+# a half-purged database. 03:00 is the yard-sale prune, 04:00 the backup,
+# 05:00 this. Nothing overlaps.
+#
+# Expect a brief 404 burst while it runs if a soak is live: it deletes
+# rows that in-flight sessions have already scraped ids for. Measured
+# 2026-10-16 -- about 15 404s/sec for five minutes, then clean. That is
+# the test following deleted listings, not a fault.
 apiVersion: batch/v1
 kind: CronJob
 metadata:
   name: loadtest-purge-nightly
   namespace: laravel-spa
 spec:
-  schedule: "0 4 * * *"
+  schedule: "0 5 * * *"
   timeZone: "America/Chicago"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
