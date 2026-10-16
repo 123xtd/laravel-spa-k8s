@@ -253,8 +253,11 @@ spec:
                   key: ACCOUNT_PASSWORD
             - name: KNOWN_LISTING
               value: "100069"
+            # ON as of 2026-10-16: a category click now makes a real
+            # request (/browse/subcategory). Off, the soak would stop
+            # following the journey it claims to.
             - name: SUBCATEGORY_REQUESTS
-              value: "false"
+              value: "true"
             - name: PHOTO_KB
               value: "200"
           # The namespace runs PodSecurity "restricted" in warn mode, and

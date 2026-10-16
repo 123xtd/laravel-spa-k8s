@@ -641,40 +641,45 @@ data:
     // A subcategory view. Today this is client-side only, so it is
     // modelled as the partial reload it WILL be once Phase 2 lands --
     // which is also how we will measure whether Phase 2 helped.
-    const CATEGORIES = ['Vehicle', 'Computer', 'Kitchen', 'Furniture', 'Tool', 'Pet'];
+    // Bare SUBCATEGORY names -- what /browse/subcategory takes, and what
+    // Starship3's selectedLink holds. The old list held TOP-LEVEL names
+    // ('Vehicle', 'Computer') because the old step loaded `/?category=X`,
+    // a whole page. 'House' is in here deliberately: it exists under both
+    // Real Estate and Rentals, so it exercises the multi-parent
+    // resolution the endpoint does.
+    const SUBCATEGORIES = ['Snowmobile', 'Auto', 'Truck', 'Boat', 'Desktop',
+      'Laptop', 'Tableware', 'Appliance', 'Living', 'Bedroom', 'Hockey',
+      'Mens', 'Womens', 'Consumer', 'TV', 'Cameras', 'House', 'Condo',
+      'Plants', 'Tools'];
+
     function viewSubcategory() {
-      const c = CATEGORIES[Math.floor(Math.random() * CATEGORIES.length)];
-      // A plain page load, NOT an Inertia partial.
+      // PHASE 2 IS BUILT, so this is a real request again.
       //
-      // Sending X-Inertia without a matching X-Inertia-Version makes
-      // Inertia return 409 Conflict (asset-version mismatch), which is
-      // what made this step fail 100% of the time on the first smoke
-      // run. There is also nothing to fetch partially yet: the
-      // ?category= handling is Phase 2.
+      // It used to be a full page load of `/?category=X`, and was then
+      // turned off entirely (SUBCATEGORY_REQUESTS=false) because clicking
+      // a category issued no server request at all -- the home page
+      // carried the 200 newest listings site-wide and the browser
+      // filtered them. That was 27% of all traffic modelling something
+      // production never did.
       //
-      // So this measures what a category view costs TODAY -- a full,
-      // uncached home page, since CacheGuestPage excludes any request
-      // carrying a query string. That is deliberately the "before"
-      // number Phase 2 will be compared against.
-      // SUBCATEGORY_REQUESTS=false models what the site does TODAY: a
-      // category click filters the already-loaded cards client-side and
-      // issues no server request at all. The request below was always a
-      // stand-in for a change that has not been built, and it was 27% of
-      // all traffic in earlier runs -- a quarter of the offered load that
-      // production never sees, costing 49 statements a time because a
-      // query string bypasses the page cache.
-      //
-      // Left available because it is still the honest "before" figure for
-      // that change. But a run meant to find the real ceiling must not
-      // include it.
-      // No sleep here on purpose: the caller already does think(6, 0.8)
-      // after this step, which is the time the visitor spends reading the
-      // filtered list. Pausing again would halve the effective load.
+      // Now a category click DOES hit the server, for that subcategory's
+      // own 60 newest, about 12 KB. Leaving this off would mean the soak
+      // no longer follows the journey it claims to: a lighter home page
+      // and nothing after it, which flatters the change by exactly the
+      // request the change introduced. It also leaves the new endpoint,
+      // its per-subcategory cache and its regeneration lock entirely
+      // untested under load.
       if (!SUBCATEGORY_REQUESTS) {
         return null;
       }
+
+      const c = SUBCATEGORIES[Math.floor(Math.random() * SUBCATEGORIES.length)];
+
+      // No sleep here on purpose: the caller already does think(6, 0.8)
+      // after this step, which is the time the visitor spends reading the
+      // list. Pausing again would halve the effective load.
       return step(T.subcategory, 'subcategory', () =>
-        get(`/?category=${encodeURIComponent(c)}`));
+        get(`/browse/subcategory?sub=${encodeURIComponent(c)}`));
     }
 
     function openListingsIndex() {
@@ -1250,8 +1255,11 @@ spec:
               value: "30s"
             # Zero server requests per category click, which is what the
             # site actually does today. See viewSubcategory().
+            # ON as of 2026-10-16: a category click now makes a real
+            # request (/browse/subcategory). Off, the soak would stop
+            # following the journey it claims to.
             - name: SUBCATEGORY_REQUESTS
-              value: "false"
+              value: "true"
             - name: RAMP_UNIT
               value: "1m"
             # Must span the whole staircase -- 7 steps x (30s ramp + 3m
