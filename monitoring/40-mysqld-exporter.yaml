@@ -53,23 +53,26 @@ spec:
             - --collect.global_status
             - --collect.global_variables
             - --collect.info_schema.innodb_metrics
-            # engine_innodb_status and slave_status are OFF, and both for
-            # the same reason: the `laravel` user does not have the
-            # privilege, so each one issued a query that was refused on
-            # every scrape -- an error line every 15 seconds and a
-            # pointless round trip to the database box.
+            # engine_innodb_status is BACK ON as of 2026-10-16: PROCESS
+            # was granted and `SHOW ENGINE INNODB STATUS` now returns.
+            # It carries buffer-pool internals and lock-wait detail,
+            # which is the depth that matters during a stall.
             #
-            #   engine_innodb_status  needs PROCESS
-            #   slave_status          needs REPLICATION CLIENT (or SUPER)
+            # The grant that was actually needed, and the trap in it:
             #
-            # slave_status is simply not applicable -- there is no
-            # replica. engine_innodb_status IS worth having (buffer pool
-            # and lock detail during a stall), so to re-enable it:
+            #   GRANT PROCESS ON *.* TO 'laravel'@'192.168.100.%';
             #
-            #   GRANT PROCESS ON *.* TO 'laravel'@'%';
-            #
-            # then drop the --no-collect line below and restore
-            # --collect.engine_innodb_status.
+            # NOT `'laravel'@'%'` -- that account does not exist, and
+            # MySQL 8 refuses to create one via GRANT, so the attempt
+            # fails with "not allowed to create a user with GRANT" and
+            # nothing changes. The account is scoped to the LAN subnet
+            # because Flannel masquerades pod traffic leaving the cluster
+            # to the NODE's address, so MySQL sees 192.168.100.101/.134/
+            # .137 and never the 10.244.x.x pod IPs.
+            - --collect.engine_innodb_status
+            # slave_status stays off: it needs REPLICATION CLIENT and
+            # there is no replica, so it only ever issued a query that
+            # was refused on every scrape.
             - --no-collect.slave_status
           env:
             - name: MYSQLD_EXPORTER_PASSWORD
