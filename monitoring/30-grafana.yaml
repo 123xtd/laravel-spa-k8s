@@ -60,6 +60,752 @@ data:
   # Separate from capacity.json on purpose: that one answers "what is the
   # cluster doing", this one answers "what did this load test find", and
   # they are read at different times by different questions.
+  # REAL TRAFFIC, as opposed to everything else here.
+  #
+  # Both other dashboards measure k6. This one measures people, from
+  # Traefik's own counters, and it is scoped to the PRODUCTION
+  # IngressRoute only -- the test domains and the clone are excluded
+  # permanently, so synthetic load can never be mistaken for visitors.
+  #
+  # It reads near zero until buyandsellpage.com/.ca are switched from
+  # maintenance-page to the app. That is correct, not broken.
+  #
+  # Volume here decides when to add equipment. p95 latency decides
+  # whether something is wrong -- because CPU cannot see an I/O stall,
+  # which this project measured at a 10.79s home p95 while the HPA sat
+  # idle.
+  live-traffic.json: |
+    {
+      "uid": "live-traffic",
+      "title": "Live site: real traffic",
+      "tags": [
+        "live"
+      ],
+      "timezone": "browser",
+      "schemaVersion": 39,
+      "version": 1,
+      "refresh": "30s",
+      "time": {
+        "from": "now-6h",
+        "to": "now"
+      },
+      "description": "Real visitor traffic, from Traefik. Everything on the capacity dashboards is k6 -- synthetic. This is the one that reflects people. Volume here is what decides when to add equipment; p95 latency is what decides whether something is wrong, because CPU cannot see an I/O stall.",
+      "panels": [
+        {
+          "type": "stat",
+          "title": "Requests / sec",
+          "gridPos": {
+            "x": 0,
+            "y": 0,
+            "w": 4,
+            "h": 4
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "expr": "sum(rate(traefik_service_requests_total{service=~\"laravel-spa-laravel-spa-https-.*\"}[5m]))",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "#199e70",
+                    "value": null
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              },
+              "decimals": 1
+            },
+            "overrides": []
+          },
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "textMode": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            }
+          },
+          "description": "Real visitor traffic on the production route only. Reads near zero until buyandsellpage.com/.ca are switched from maintenance-page to the app -- the test domains and the clone are deliberately excluded, permanently, so test load can never be mistaken for visitors."
+        },
+        {
+          "type": "stat",
+          "title": "p95 latency",
+          "gridPos": {
+            "x": 4,
+            "y": 0,
+            "w": 4,
+            "h": 4
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(traefik_service_request_duration_seconds_bucket{service=~\"laravel-spa-laravel-spa-https-.*\"}[5m])))",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "#199e70",
+                    "value": null
+                  },
+                  {
+                    "color": "#c98500",
+                    "value": 1
+                  },
+                  {
+                    "color": "#d03b3b",
+                    "value": 3
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              },
+              "unit": "s",
+              "decimals": 3
+            },
+            "overrides": []
+          },
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "textMode": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            }
+          },
+          "description": "The signal CPU cannot see. An I/O stall moves this and nothing else."
+        },
+        {
+          "type": "stat",
+          "title": "Errors (5xx)",
+          "gridPos": {
+            "x": 8,
+            "y": 0,
+            "w": 4,
+            "h": 4
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "expr": "(sum(rate(traefik_service_requests_total{service=~\"laravel-spa-laravel-spa-https-.*\",code=~\"5..\"}[5m])) or vector(0)) / clamp_min(sum(rate(traefik_service_requests_total{service=~\"laravel-spa-laravel-spa-https-.*\"}[5m])), 0.001)",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "#199e70",
+                    "value": null
+                  },
+                  {
+                    "color": "#c98500",
+                    "value": 0.005
+                  },
+                  {
+                    "color": "#d03b3b",
+                    "value": 0.02
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              },
+              "unit": "percentunit",
+              "decimals": 2
+            },
+            "overrides": []
+          },
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "textMode": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            }
+          },
+          "description": "`or vector(0)` so a healthy site reads 0 instead of going blank."
+        },
+        {
+          "type": "stat",
+          "title": "App pods",
+          "gridPos": {
+            "x": 12,
+            "y": 0,
+            "w": 4,
+            "h": 4
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "expr": "kube_horizontalpodautoscaler_status_current_replicas{horizontalpodautoscaler=\"laravel-spa-app\"}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "#199e70",
+                    "value": null
+                  },
+                  {
+                    "color": "#c98500",
+                    "value": 36
+                  },
+                  {
+                    "color": "#d03b3b",
+                    "value": 40
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "textMode": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            }
+          },
+          "description": "Amber near the 40 ceiling: at max with latency rising means add equipment."
+        },
+        {
+          "type": "stat",
+          "title": "TLS expires in",
+          "gridPos": {
+            "x": 16,
+            "y": 0,
+            "w": 4,
+            "h": 4
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "expr": "min(traefik_tls_certs_not_after - time()) / 86400",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "#d03b3b",
+                    "value": null
+                  },
+                  {
+                    "color": "#c98500",
+                    "value": 14
+                  },
+                  {
+                    "color": "#199e70",
+                    "value": 21
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              },
+              "unit": "d",
+              "decimals": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "textMode": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            }
+          },
+          "description": "cert-manager renews automatically; this is the check that it did."
+        },
+        {
+          "type": "stat",
+          "title": "Open connections",
+          "gridPos": {
+            "x": 20,
+            "y": 0,
+            "w": 4,
+            "h": 4
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "expr": "sum(traefik_open_connections)",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "#199e70",
+                    "value": null
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              },
+              "decimals": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "textMode": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            }
+          },
+          "description": "Concurrency at the edge."
+        },
+        {
+          "type": "timeseries",
+          "title": "Requests / sec by response code",
+          "gridPos": {
+            "x": 0,
+            "y": 4,
+            "w": 12,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "expr": "sum by (code) (rate(traefik_service_requests_total{service=~\"laravel-spa-laravel-spa-https-.*\"}[5m]))",
+              "legendFormat": "{{code}}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 8,
+                "showPoints": "never",
+                "pointSize": 8,
+                "stacking": {
+                  "mode": "normal"
+                }
+              },
+              "color": {
+                "mode": "palette-classic"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "description": "Stacked by status. A 5xx band appearing is the thing to notice."
+        },
+        {
+          "type": "timeseries",
+          "title": "Latency percentiles",
+          "gridPos": {
+            "x": 12,
+            "y": 4,
+            "w": 12,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.50, sum by (le) (rate(traefik_service_request_duration_seconds_bucket{service=~\"laravel-spa-laravel-spa-https-.*\"}[5m])))",
+              "legendFormat": "p50",
+              "refId": "A"
+            },
+            {
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(traefik_service_request_duration_seconds_bucket{service=~\"laravel-spa-laravel-spa-https-.*\"}[5m])))",
+              "legendFormat": "p95",
+              "refId": "B"
+            },
+            {
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(traefik_service_request_duration_seconds_bucket{service=~\"laravel-spa-laravel-spa-https-.*\"}[5m])))",
+              "legendFormat": "p99",
+              "refId": "C"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "pointSize": 8,
+                "stacking": {
+                  "mode": "none"
+                }
+              },
+              "color": {
+                "mode": "palette-classic"
+              },
+              "unit": "s"
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "description": "A fast median with a bad tail is a herd, not saturation. Watch the gap between p50 and p99."
+        },
+        {
+          "type": "timeseries",
+          "title": "App tier CPU, cores used of the five untainted workers",
+          "gridPos": {
+            "x": 0,
+            "y": 12,
+            "w": 12,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "expr": "sum(rate(container_cpu_usage_seconds_total{namespace=\"laravel-spa\",pod=~\"laravel-spa-app-.*\",container=\"app\"}[5m]))",
+              "legendFormat": "app tier cores",
+              "refId": "A"
+            },
+            {
+              "expr": "count(kube_node_info{node=~\"talos-(cn9|icf|k27|o06|u4h).*\"}) * 0 + 64",
+              "legendFormat": "cores available",
+              "refId": "B"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "pointSize": 8,
+                "stacking": {
+                  "mode": "none"
+                }
+              },
+              "color": {
+                "mode": "palette-classic"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "description": "Headroom. Three and a half days at 72 sessions/sec used under 5 of 64."
+        },
+        {
+          "type": "timeseries",
+          "title": "Database",
+          "gridPos": {
+            "x": 12,
+            "y": 12,
+            "w": 12,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "expr": "mysql_global_status_threads_running",
+              "legendFormat": "threads running",
+              "refId": "A"
+            },
+            {
+              "expr": "rate(mysql_global_status_queries[5m])",
+              "legendFormat": "queries/sec",
+              "refId": "B"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "pointSize": 8,
+                "stacking": {
+                  "mode": "none"
+                }
+              },
+              "color": {
+                "mode": "palette-classic"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "description": "threads_running is the one to watch: 24 cores means ~24 concurrent queries before contention."
+        },
+        {
+          "type": "timeseries",
+          "title": "Dragonfly memory",
+          "gridPos": {
+            "x": 0,
+            "y": 20,
+            "w": 12,
+            "h": 6
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "expr": "sum(container_memory_working_set_bytes{namespace=\"laravel-spa\",pod=~\"dragonfly.*\",container=\"dragonfly\"})",
+              "legendFormat": "working set",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "pointSize": 8,
+                "stacking": {
+                  "mode": "none"
+                }
+              },
+              "color": {
+                "mode": "palette-classic"
+              },
+              "unit": "bytes"
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "description": "Cache and sessions. Steady over a 3.5-day soak at 300-443 MiB."
+        },
+        {
+          "type": "timeseries",
+          "title": "Bytes served / sec",
+          "gridPos": {
+            "x": 12,
+            "y": 20,
+            "w": 12,
+            "h": 6
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "expr": "sum(rate(traefik_service_responses_bytes_total{service=~\"laravel-spa-laravel-spa-https-.*\"}[5m]))",
+              "legendFormat": "out",
+              "refId": "A"
+            },
+            {
+              "expr": "sum(rate(traefik_service_requests_bytes_total{service=~\"laravel-spa-laravel-spa-https-.*\"}[5m]))",
+              "legendFormat": "in",
+              "refId": "B"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "pointSize": 8,
+                "stacking": {
+                  "mode": "none"
+                }
+              },
+              "color": {
+                "mode": "palette-classic"
+              },
+              "unit": "Bps"
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "description": "Bandwidth. The per-category change cut the home page from 179 KB to 92 KB."
+        },
+        {
+          "type": "table",
+          "title": "Active alerts",
+          "gridPos": {
+            "x": 0,
+            "y": 26,
+            "w": 24,
+            "h": 6
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "description": "Anything Prometheus currently considers wrong. Empty is the healthy state. NOTE: these rules do not SEND anything -- email or SMS needs a contact point with credentials. Until then this panel and Prometheus's own UI are where alerts appear.",
+          "targets": [
+            {
+              "expr": "ALERTS{alertstate=\"firing\"}",
+              "refId": "A",
+              "instant": true,
+              "format": "table"
+            }
+          ],
+          "transformations": [
+            {
+              "id": "organize",
+              "options": {
+                "excludeByName": {
+                  "Time": true,
+                  "Value": true,
+                  "__name__": true,
+                  "job": true,
+                  "instance": true
+                }
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "align": "left"
+              }
+            },
+            "overrides": []
+          }
+        }
+      ]
+    }
   journey-load-test.json: |
     {
       "title": "Load test: journey run",

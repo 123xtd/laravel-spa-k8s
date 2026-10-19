@@ -76,6 +76,19 @@ data:
       scrape_interval: 15s
       evaluation_interval: 15s
 
+    # ALERT RULES, added 2026-10-19 before going live.
+    #
+    # Mounted from the same ConfigMap, so `kubectl apply` of this file
+    # ships the rules with the config that loads them.
+    #
+    # A NOTE ON DELIVERY, so nobody assumes more than exists: these rules
+    # make Prometheus mark conditions as firing, which is visible in its
+    # own UI, on the Live site dashboard's alert panel, and queryable as
+    # ALERTS{}. They do NOT send anything. Email or SMS needs a contact
+    # point with credentials -- see the Active alerts panel note.
+    rule_files:
+      - /etc/prometheus/alerts.yml
+
     scrape_configs:
       # ---- cAdvisor: per-container CPU, memory, and THROTTLING ----
       # Scraped via the API server proxy rather than hitting kubelet
@@ -196,6 +209,110 @@ data:
       - job_name: prometheus
         static_configs:
           - targets: ["localhost:9090"]
+  alerts.yml: |
+    groups:
+      - name: site
+        interval: 30s
+        rules:
+          # THE ONE THAT MATTERS MOST.
+          #
+          # This project measured a 10.79s home p95 while the CPU-based
+          # HPA sat idle and every other metric looked healthy, because
+          # the pods were waiting on I/O rather than computing. Latency
+          # is the only signal that moves during that, which is why it is
+          # first and why "HPA at max" is not a substitute.
+          #
+          # 1s against a measured normal of 0.090s: twelve times normal,
+          # not a hair trigger.
+          - alert: SiteLatencyHigh
+            expr: >
+              histogram_quantile(0.95, sum by (le) (rate(
+                traefik_service_request_duration_seconds_bucket{service=~"laravel-spa-laravel-spa-https-.*"}[5m]
+              ))) > 1
+            for: 5m
+            labels: { severity: critical }
+            annotations:
+              summary: "Site p95 latency {{ $value | humanizeDuration }} (normal is 0.090s)"
+              runbook: "Check Live site dashboard. If app CPU is low and latency is high it is an I/O stall, not load -- look at mysql threads_running and Dragonfly before adding pods."
+
+          - alert: SiteErrorsHigh
+            expr: >
+              (sum(rate(traefik_service_requests_total{service=~"laravel-spa-laravel-spa-https-.*",code=~"5.."}[5m])) or vector(0))
+              / clamp_min(sum(rate(traefik_service_requests_total{service=~"laravel-spa-laravel-spa-https-.*"}[5m])), 0.001) > 0.02
+            for: 5m
+            labels: { severity: critical }
+            annotations:
+              summary: "{{ $value | humanizePercentage }} of requests returning 5xx"
+
+          # Not "something is wrong" -- "the fleet has run out of room".
+          # With the capacity-testing era over, this is the signal that
+          # decides when to add equipment.
+          - alert: AppFleetAtCeiling
+            expr: >
+              kube_horizontalpodautoscaler_status_current_replicas{horizontalpodautoscaler="laravel-spa-app"}
+              >= kube_horizontalpodautoscaler_spec_max_replicas{horizontalpodautoscaler="laravel-spa-app"}
+            for: 15m
+            labels: { severity: warning }
+            annotations:
+              summary: "App fleet has been at its {{ $value }}-replica ceiling for 15 minutes"
+              runbook: "Raise maxReplicas if the untainted workers have cores free; add a worker if they do not."
+
+          # 24 cores means roughly 24 concurrent queries before they
+          # start contending. Measured normal is 2-6.
+          - alert: DatabaseConcurrencyHigh
+            expr: mysql_global_status_threads_running > 16
+            for: 5m
+            labels: { severity: warning }
+            annotations:
+              summary: "MySQL running {{ $value }} concurrent queries (normal is 2-6, ~24 cores available)"
+
+          - alert: DatabaseUnreachable
+            expr: mysql_up == 0
+            for: 2m
+            labels: { severity: critical }
+            annotations:
+              summary: "The database at 192.168.100.111 is not answering the exporter"
+
+          - alert: AppPodsUnavailable
+            expr: >
+              kube_deployment_status_replicas_available{deployment="laravel-spa-app"}
+              < kube_deployment_spec_replicas{deployment="laravel-spa-app"} * 0.75
+            for: 10m
+            labels: { severity: critical }
+            annotations:
+              summary: "Only {{ $value }} app pods available of the desired count"
+
+      - name: infrastructure
+        interval: 60s
+        rules:
+          # cert-manager renews automatically; this fires when it has not.
+          - alert: TLSCertificateExpiringSoon
+            expr: min(traefik_tls_certs_not_after - time()) / 86400 < 14
+            for: 1h
+            labels: { severity: warning }
+            annotations:
+              summary: "A TLS certificate expires in {{ $value | printf \"%.0f\" }} days and has not renewed"
+
+          # Prometheus holds the only record of what happened. It filling
+          # up ends the record, which is how three days of soak data was
+          # nearly lost before a size cap was added.
+          - alert: PrometheusDiskFilling
+            expr: >
+              prometheus_tsdb_storage_blocks_bytes / 1024 / 1024 / 1024 > 7
+            for: 30m
+            labels: { severity: warning }
+            annotations:
+              summary: "Prometheus is holding {{ $value | printf \"%.1f\" }} GiB against a 9.7 GiB volume and an 8 GiB retention cap"
+
+          - alert: NodeMemoryLow
+            expr: >
+              node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.10
+            for: 10m
+            labels: { severity: critical }
+            annotations:
+              summary: "{{ $labels.instance }} has {{ $value | humanizePercentage }} memory available"
+              runbook: "loadgen reaching this is what killed its kubelet on 2026-10-19 and stranded 13 pods."
+
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
