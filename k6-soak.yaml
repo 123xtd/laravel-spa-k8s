@@ -204,12 +204,18 @@ spec:
               value: "6"
             - name: SOAK_ROLE
               value: "readers"
-            # 30 days. k6 requires a duration -- there is no "forever" --
-            # so this is "long enough that the restart is a non-event".
-            # When it elapses the pod exits 0, the StatefulSet restarts
-            # it, and ~10 seconds of one generator is missing.
-            - name: SOAK_DURATION
-              value: "720h"
+            # SOAK_DURATION IS DELIBERATELY NOT SET.
+            #
+            # It used to be "720h", i.e. 30 days, on the theory that a
+            # restart should be a non-event. That is what let k6's leak
+            # accumulate for three and a half days until loadgen reached 6
+            # MB available and the kubelet died.
+            #
+            # Unset, the script computes `24h` plus the pod's ordinal
+            # times SOAK_STAGGER_MIN, so each generator recycles daily and
+            # the fleet staggers across several hours instead of all
+            # exiting at once. Setting this env var again DISABLES that --
+            # the script honours an explicit value - so leave it out.
             # Streams every 5s, so there is no end-of-run summary to wait
             # for and nothing is lost when a pod dies. On a soak this is
             # the ONLY output -- handleSummary never runs, because the pod
@@ -368,8 +374,9 @@ spec:
               value: "true"
             - name: SOAK_ROLE
               value: "writer"
-            - name: SOAK_DURATION
-              value: "720h"
+            # Not set, for the same reason as the readers -- see above.
+            # There is only one writer, so its stagger offset is zero and
+            # it simply recycles every 24h.
             # SITE-WIDE write rates, not per-generator, because there is
             # exactly one of these pods.
             #
