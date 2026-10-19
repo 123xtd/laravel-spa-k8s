@@ -64,7 +64,18 @@ spec:
           # and picks changes up.
           #
           # To unfreeze, put `:latest` back and roll the deployment.
-          image: ghcr.io/123xtd/laravel-spa-app@sha256:428bb36da4c58cfacecd02ab5dbc121ba12404bbcafa51e4d08cdc006ad8daa4
+          # PROMOTED 2026-10-19: this digest is the clone, after it held
+          # 72 sessions/sec for three and a half days with home p95 pinned
+          # at 0.090s, zero failures and zero drift. It carries
+          # per-category browse, the listing-expiry work and the prune
+          # cache fixes.
+          #
+          # Still a digest, and still for the original reason: a floating
+          # tag means an overnight registry push changes production with
+          # nothing in the manifest to show it. The clone stays on
+          # :latest and picks up each build; promoting is the deliberate
+          # act of moving this line.
+          image: ghcr.io/123xtd/laravel-spa-app@sha256:5eaeb409fe3a4c95d778a7c3f08470886b6be0ce09cc821e60a9e1fb2a0280b5
           ports:
             - containerPort: 8080
           envFrom:
@@ -101,6 +112,28 @@ spec:
             # maxclients (default 10,000).
             - name: REDIS_PERSISTENT
               value: "true"
+            # THE PAGE CACHE, which this tier has never had.
+            #
+            # It was the A/B control, so it ran with the cache off while
+            # the clone ran with it on. Measured before it existed: the
+            # home page cost 27 queries and ~83 KB of freshly serialised
+            # JSON on every single load, and four consecutive loads
+            # produced byte-identical output.
+            - name: PAGE_CACHE_ENABLED
+              value: "true"
+            - name: PAGE_CACHE_PATHS
+              value: "/,/listings,/post,/terms,/privacy,/cookies,/accessibility,/about"
+            # EXPLICIT, AND DISTINCT FROM THE CLONE'S.
+            #
+            # Both tiers share one Dragonfly. The clone uses db2 and db3;
+            # unset, Laravel defaults to 0 and 1, so they do not collide
+            # today -- but only by accident of the defaults. Naming them
+            # means a future change to the shared secret cannot quietly
+            # put test traffic into live sessions.
+            - name: REDIS_DB
+              value: "0"
+            - name: REDIS_CACHE_DB
+              value: "1"
           securityContext:
             allowPrivilegeEscalation: false
             runAsNonRoot: true
@@ -138,6 +171,70 @@ spec:
               path: /healthz
               port: 8080
             initialDelaySeconds: 15
+---
+# THE LIVE TIER HAD NO AUTOSCALER AT ALL.
+#
+# It was the A/B control, fixed at 24 replicas so the comparison was not
+# confounded by scaling. Going live, that is no longer a feature: a fixed
+# fleet cannot absorb anything the floor does not already cover.
+#
+# Mirrors the clone's, which is what the three-and-a-half-day run
+# exercised. Two things worth knowing about it, both measured here:
+#
+#   - The floor is the number that matters. A burst lands in seconds and
+#     a pod needs ~30s to start and warm, so whatever the floor happens
+#     to be IS the burst capacity. 24 idle pods cost ~1.2 cores and 12Gi.
+#
+#   - AverageValue, not Utilization: with no resource requests there is
+#     nothing to take a percentage OF, and the HPA would report <unknown>
+#     forever and never scale.
+#
+# And the known limitation, which no HPA setting fixes: CPU cannot see an
+# I/O stall. The home page hit a 10.79s p95 while this metric sat idle,
+# because the pods were waiting rather than computing. That is what the
+# latency alerting is for, not this.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: laravel-spa-app
+  namespace: laravel-spa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: laravel-spa-app
+  minReplicas: 24
+  # 40 rather than the clone file's 200: 40 is what has actually been
+  # exercised. Raising it is a deliberate decision to take once real
+  # traffic says something about where this tier sits.
+  maxReplicas: 40
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: AverageValue
+          averageValue: 500m
+  behavior:
+    # Asymmetric on purpose: scaling up late costs users their page,
+    # scaling down late costs a few idle pods.
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+        - type: Pods
+          value: 8
+          periodSeconds: 15
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 25
+          periodSeconds: 60
+      selectPolicy: Max
 ---
 apiVersion: v1
 kind: Service
