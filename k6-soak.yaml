@@ -275,10 +275,44 @@ spec:
           volumeMounts:
             - name: script
               mountPath: /scripts
-          # Explicitly empty, and load-bearing: `kubectl apply` does not
-          # clear an omitted field, so a previously-applied request or
-          # limit would survive a file that stopped mentioning it.
-          resources: {}
+          # A MEMORY LIMIT, AND A DELIBERATE EXCEPTION TO THE NO-LIMITS
+          # POLICY.
+          #
+          # That policy exists because a request RESERVES capacity on a
+          # SHARED cluster node and the scheduler then places pods on
+          # reservations rather than reality. loadgen is single-tenant and
+          # has the opposite failure mode, which it demonstrated on
+          # 2026-10-19: k6 leaks ~200 MiB per generator per day, twelve of
+          # them climbed from 1.49 GiB to 12.03 GiB over three and a half
+          # days, and the box reached 6 MB available. The kubelet could no
+          # longer post node status, loadgen went NotReady, and all
+          # thirteen pods were stranded Terminating -- while the site
+          # itself was perfectly healthy the entire time.
+          #
+          # Unlimited BestEffort pods on a dedicated box do not protect
+          # it; they take it down together. A limit means one runaway is
+          # OOM-killed alone and the StatefulSet replaces it.
+          #
+          # 1Gi, and the number is a trade-off worth stating:
+          #
+          #   steady           ~289 MiB   (12 x 6/sec, measured)
+          #   degraded        ~1.05 GiB   (k6 grows to maxVUs 459 when the
+          #                                site slows: 459 x 2.11 MB)
+          #
+          # So 1Gi sits just UNDER a fully degraded generator. In a severe
+          # slowdown some generators will be killed and restarted rather
+          # than riding it out. That is the lesser evil: losing one
+          # generator for 20 seconds costs a twelfth of the offered load
+          # and the samples already streamed to Prometheus survive, where
+          # losing the NODE cost three days of run and hours of downtime.
+          #
+          # It also enforces the replica cap in the scheduler instead of in
+          # a comment: with no request set Kubernetes defaults the request
+          # to the limit, so a 13th reader goes Pending rather than
+          # overcommitting the box. Real headroom needs the DIMMs.
+          resources:
+            limits:
+              memory: 1Gi
           # No requests, no limits -- by policy. Accepted trade-off: these
           # are BestEffort, so under real memory pressure the kubelet
           # evicts them first. On a dedicated generator box with nothing
@@ -413,7 +447,13 @@ spec:
           volumeMounts:
             - name: script
               mountPath: /scripts
-          resources: {}
+          # The writer pre-allocates for saver (400) and enquirer (200),
+          # so its ceiling is 640 maxVUs against the readers' 459 -- about
+          # 1.35 GiB fully grown. There is one of it, so the headroom is
+          # affordable.
+          resources:
+            limits:
+              memory: 2Gi
       volumes:
         - name: script
           configMap:

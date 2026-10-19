@@ -181,7 +181,33 @@ data:
     // One writer pod at the true site-wide rate has no such floor.
     const SOAK = (__ENV.SOAK || 'false') === 'true';
     const SOAK_RATE = parseFloat(__ENV.SOAK_RATE || '6');
-    const SOAK_DURATION = __ENV.SOAK_DURATION || '720h';
+    // RECYCLING IS MANDATORY, AND THIS IS WHY.
+    //
+    // k6 leaks. Measured over the 2026-10-15..19 soak: twelve generators
+    // went from 1.49 GiB to 12.03 GiB in three and a half days -- an
+    // eightfold climb -- while the site's home p95 never moved off
+    // 0.090s. Not demand: demand would have moved with latency. About
+    // 200 MiB per generator per day, monotonic, never released.
+    //
+    // It ended with loadgen at 6 MB available, the kubelet unable to post
+    // node status, the node NotReady and all thirteen pods stranded
+    // Terminating. The site was fine throughout and the instrument died.
+    //
+    // So a soak pod exits and is replaced on a timer. 24h by default,
+    // which caps the leak at ~200 MiB per generator.
+    //
+    // STAGGERED BY POD ORDINAL, because a StatefulSet only rolls pods one
+    // at a time on UPDATES -- when pods exit by themselves they all exit
+    // together, and twelve simultaneous restarts would drop the entire
+    // offered load for half a minute every day. k6-soak-readers-7 gets
+    // 24h plus 7 x SOAK_STAGGER_MIN, so the fleet recycles one generator
+    // at a time across several hours and the load never dips by more than
+    // one twelfth.
+    const SOAK_STAGGER_MIN = parseInt(__ENV.SOAK_STAGGER_MIN || '17', 10);
+    const ORDINAL = parseInt((String(__ENV.POD_NAME || '').match(/(\d+)$/) || [0, 0])[1], 10) || 0;
+    const SOAK_DURATION = __ENV.SOAK_DURATION
+      ? __ENV.SOAK_DURATION
+      : `24h${ORDINAL * SOAK_STAGGER_MIN}m`;
     const SOAK_ROLE = __ENV.SOAK_ROLE || 'both';
     // Mean session seconds per read persona, MEASURED 2026-10-16 on the
     // first soak. Override to re-tune without editing the script:
