@@ -357,6 +357,20 @@ apiVersion: traefik.io/v1alpha1
 kind: IngressRoute
 metadata:
   name: laravel-spa-https
+  # WENT LIVE 2026-10-20. Both routes pointed at maintenance-page until
+  # now; apex and www now serve the app.
+  #
+  # True at the moment of the switch: this tier runs the digest that held
+  # 72 sessions/sec for three and a half days with home p95 pinned at
+  # 0.090s; the page cache is on; an HPA exists; the database holds one
+  # real account and two real listings after 243 synthetic accounts and
+  # 97,924 seeded listings were removed; alerting delivers to Discord,
+  # verified by sending real alerts rather than assuming; and all three
+  # production hostnames were checked against the app directly, returning
+  # 200 with the per-category payload and the correct region split.
+  #
+  # To put the maintenance page back: change these two services to
+  # maintenance-page and apply. Nothing else moves.
   namespace: laravel-spa
 spec:
   entryPoints:
@@ -365,12 +379,12 @@ spec:
     - match: Host(`buyandsellpage.com`) || Host(`buyandsellpage.ca`)
       kind: Rule
       services:
-        - name: maintenance-page
+        - name: laravel-spa-app
           port: 80
     - match: Host(`www.buyandsellpage.com`) || Host(`www.buyandsellpage.ca`)
       kind: Rule
       services:
-        - name: maintenance-page
+        - name: laravel-spa-app
           port: 80
       middlewares:
         - name: redirect-www-to-apex
