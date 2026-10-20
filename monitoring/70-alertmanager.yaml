@@ -36,16 +36,20 @@ metadata:
 data:
   alertmanager.yml: |
     global:
+      # SMTP IS COMMENTED OUT until credentials exist. Alertmanager
+      # validates this block at startup, so leaving it configured with no
+      # secret makes the pod fail rather than fall back to the webhook.
+      #
       # SES in us-east-1, matching the region the app already sends from.
       # 587 with STARTTLS; SES rejects unencrypted submission.
-      smtp_smarthost: 'email-smtp.us-east-1.amazonaws.com:587'
+      # smtp_smarthost: 'email-smtp.us-east-1.amazonaws.com:587'
       # Any address at a verified domain works. buyandsellpage.ca is
       # verified with DKIM, SPF and DMARC, which is also what keeps these
       # out of a spam folder -- an alert in spam is not an alert.
-      smtp_from: 'alerts@buyandsellpage.ca'
-      smtp_auth_username_file: /etc/alertmanager/smtp/username
-      smtp_auth_password_file: /etc/alertmanager/smtp/password
-      smtp_require_tls: true
+      # smtp_from: 'alerts@buyandsellpage.ca'
+      # smtp_auth_username_file: /etc/alertmanager/smtp/username
+      # smtp_auth_password_file: /etc/alertmanager/smtp/password
+      # smtp_require_tls: true
 
     route:
       receiver: warnings
@@ -69,9 +73,25 @@ data:
           repeat_interval: 1h
 
     receivers:
+      # PHONE PUSH, via ntfy. The primary path, because it needs no
+      # account and no credentials -- which matters when the SES console
+      # is not reachable.
+      #
+      # The topic URL lives in a secret and is read from a file, so an
+      # unguessable topic name never lands in git. ntfy topics are public
+      # to anyone who knows the name: for "site latency high" that is low
+      # stakes, but it is why the name is random rather than
+      # "buyandsellpage-alerts".
+      #
+      # Install the ntfy app, subscribe to the same topic, and alerts
+      # arrive as push notifications.
       - name: critical
-        email_configs:
-          - to: 'CHANGEME@example.com'
+        webhook_configs:
+          - url_file: /etc/alertmanager/ntfy/url
+            # ntfy returns 200 for anything it accepted; no retry storm.
+            send_resolved: true
+        # email_configs:
+        #   - to: 'CHANGEME@example.com'
             headers:
               Subject: '[CRITICAL] {{ .CommonLabels.alertname }} — buyandsellpage'
             # Plain text on purpose: this gets read on a phone, from a
@@ -85,8 +105,11 @@ data:
               Started: {{ .StartsAt.Format "15:04 MST on 2 Jan" }}
               {{ end }}
       - name: warnings
-        email_configs:
-          - to: 'CHANGEME@example.com'
+        webhook_configs:
+          - url_file: /etc/alertmanager/ntfy/url
+            send_resolved: true
+        # email_configs:
+        #   - to: 'CHANGEME@example.com'
             headers:
               Subject: '[warning] {{ .CommonLabels.alertname }} — buyandsellpage'
             text: |
@@ -97,6 +120,26 @@ data:
               Dashboard: http://192.168.100.201:3000/d/live-traffic
               {{ end }}
 
+    # ---------------------------------------------------------------
+    # A CLEANER CHANNEL, when you want one.
+    #
+    # Alertmanager's webhook sends ITS OWN JSON schema and cannot
+    # template the body, so ntfy shows a raw JSON blob. Readable, but not
+    # at 3am. Both of these are natively supported and format properly,
+    # and both take about two minutes:
+    #
+    #   Discord   create a channel webhook, then swap webhook_configs for
+    #               discord_configs:
+    #                 - webhook_url_file: /etc/alertmanager/ntfy/url
+    #
+    #   Telegram  message @BotFather for a token, then:
+    #               telegram_configs:
+    #                 - bot_token_file: /etc/alertmanager/ntfy/url
+    #                   chat_id: <your chat id>
+    #
+    # Either reuses the same secret mount, so only the receiver block
+    # changes.
+    # ---------------------------------------------------------------
     inhibit_rules:
       # If the database is unreachable, do not also send the latency and
       # error-rate alerts it caused. One cause, one email.
@@ -136,6 +179,9 @@ spec:
             - name: smtp
               mountPath: /etc/alertmanager/smtp
               readOnly: true
+            - name: ntfy
+              mountPath: /etc/alertmanager/ntfy
+              readOnly: true
             - name: data
               mountPath: /alertmanager
           readinessProbe:
@@ -160,6 +206,10 @@ spec:
         - name: smtp
           secret:
             secretName: alertmanager-smtp
+            optional: true
+        - name: ntfy
+          secret:
+            secretName: alertmanager-ntfy
         - name: data
           # Deliberately ephemeral: the only state is in-flight
           # notification dedup, worth seconds, not a PVC.
