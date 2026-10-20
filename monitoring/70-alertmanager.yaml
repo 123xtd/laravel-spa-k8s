@@ -1,0 +1,178 @@
+# Delivery for the Prometheus alert rules.
+#
+# The rules in 10-prometheus.yaml mark conditions as firing. Nothing sent
+# them anywhere, which meant the only way to learn about a problem was to
+# go and look -- and this project's own finding is that the site can be
+# unusable while every dashboard looks healthy.
+#
+# WHAT THIS CANNOT DO, stated first so nobody relies on more than exists:
+# Alertmanager runs INSIDE the cluster it watches. If the node hosting it
+# dies, the ISP drops, DNS breaks or Talos wedges, there is no alert --
+# because the alerter is gone too. That is not hypothetical: loadgen's
+# kubelet died silently on 2026-10-19 and nothing reported it.
+#
+# An external probe is the only thing that covers that, and it has to be
+# a third-party service outside this network. This handles the other
+# case: the site is up and something is wrong with it.
+#
+# ---------------------------------------------------------------------
+# BEFORE THIS WORKS, create the SMTP secret. SES SMTP credentials are NOT
+# the AWS access keys already in laravel-spa-secrets -- SES issues
+# separate ones, from the console under SMTP settings -> Create SMTP
+# credentials:
+#
+#   kubectl create secret generic alertmanager-smtp -n monitoring \
+#     --from-literal=username='<SES SMTP username>' \
+#     --from-literal=password='<SES SMTP password>'
+#
+# Until it exists the pod stays Pending on the missing secret, which is
+# deliberate: a silently unconfigured alerter is worse than an obviously
+# broken one.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: monitoring
+data:
+  alertmanager.yml: |
+    global:
+      # SES in us-east-1, matching the region the app already sends from.
+      # 587 with STARTTLS; SES rejects unencrypted submission.
+      smtp_smarthost: 'email-smtp.us-east-1.amazonaws.com:587'
+      # Any address at a verified domain works. buyandsellpage.ca is
+      # verified with DKIM, SPF and DMARC, which is also what keeps these
+      # out of a spam folder -- an alert in spam is not an alert.
+      smtp_from: 'alerts@buyandsellpage.ca'
+      smtp_auth_username_file: /etc/alertmanager/smtp/username
+      smtp_auth_password_file: /etc/alertmanager/smtp/password
+      smtp_require_tls: true
+
+    route:
+      receiver: warnings
+      # Group by alertname so twelve pods failing the same way is one
+      # email, not twelve.
+      group_by: ['alertname']
+      # 30s before the first email, so a brief blip that resolves itself
+      # does not wake anyone.
+      group_wait: 30s
+      group_interval: 5m
+      # Four hours before repeating an alert that is still firing. Short
+      # enough not to be forgotten, long enough not to become noise that
+      # gets filtered.
+      repeat_interval: 4h
+      routes:
+        # Critical jumps the queue: 0s wait and an hourly reminder while
+        # it is still broken.
+        - matchers: [ 'severity="critical"' ]
+          receiver: critical
+          group_wait: 0s
+          repeat_interval: 1h
+
+    receivers:
+      - name: critical
+        email_configs:
+          - to: 'CHANGEME@example.com'
+            headers:
+              Subject: '[CRITICAL] {{ .CommonLabels.alertname }} — buyandsellpage'
+            # Plain text on purpose: this gets read on a phone, from a
+            # notification shade, probably at an inconvenient hour.
+            text: |
+              {{ range .Alerts }}{{ .Annotations.summary }}
+
+              {{ if .Annotations.runbook }}What to check: {{ .Annotations.runbook }}
+              {{ end }}
+              Dashboard: http://192.168.100.201:3000/d/live-traffic
+              Started: {{ .StartsAt.Format "15:04 MST on 2 Jan" }}
+              {{ end }}
+      - name: warnings
+        email_configs:
+          - to: 'CHANGEME@example.com'
+            headers:
+              Subject: '[warning] {{ .CommonLabels.alertname }} — buyandsellpage'
+            text: |
+              {{ range .Alerts }}{{ .Annotations.summary }}
+
+              {{ if .Annotations.runbook }}What to check: {{ .Annotations.runbook }}
+              {{ end }}
+              Dashboard: http://192.168.100.201:3000/d/live-traffic
+              {{ end }}
+
+    inhibit_rules:
+      # If the database is unreachable, do not also send the latency and
+      # error-rate alerts it caused. One cause, one email.
+      - source_matchers: [ 'alertname="DatabaseUnreachable"' ]
+        target_matchers: [ 'severity=~"critical|warning"' ]
+        equal: []
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alertmanager
+  template:
+    metadata:
+      labels:
+        app: alertmanager
+    spec:
+      containers:
+        - name: alertmanager
+          image: prom/alertmanager:v0.28.1
+          args:
+            - --config.file=/etc/alertmanager/alertmanager.yml
+            # Notifications in flight survive a restart, so a crash does
+            # not swallow an alert that was mid-send.
+            - --storage.path=/alertmanager
+          ports:
+            - name: web
+              containerPort: 9093
+          volumeMounts:
+            - name: config
+              mountPath: /etc/alertmanager
+            - name: smtp
+              mountPath: /etc/alertmanager/smtp
+              readOnly: true
+            - name: data
+              mountPath: /alertmanager
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: 9093
+            initialDelaySeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 65534
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          # No requests, no limits -- by policy.
+          resources: {}
+      volumes:
+        - name: config
+          configMap:
+            name: alertmanager-config
+        - name: smtp
+          secret:
+            secretName: alertmanager-smtp
+        - name: data
+          # Deliberately ephemeral: the only state is in-flight
+          # notification dedup, worth seconds, not a PVC.
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+  namespace: monitoring
+spec:
+  selector:
+    app: alertmanager
+  ports:
+    - port: 9093
+      targetPort: 9093

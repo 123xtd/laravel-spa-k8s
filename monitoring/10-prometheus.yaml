@@ -89,6 +89,17 @@ data:
     rule_files:
       - /etc/prometheus/alerts.yml
 
+    # WHERE FIRING ALERTS GO. See 70-alertmanager.yaml.
+    #
+    # Without this block the rules above evaluate and sit there: visible
+    # in Prometheus's UI and on the Live site dashboard, and delivered
+    # nowhere. Prometheus logs connection failures harmlessly if
+    # Alertmanager is not up, and keeps evaluating regardless.
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets: ['alertmanager.monitoring.svc.cluster.local:9093']
+
     scrape_configs:
       # ---- cAdvisor: per-container CPU, memory, and THROTTLING ----
       # Scraped via the API server proxy rather than hitting kubelet
