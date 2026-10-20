@@ -225,20 +225,45 @@ data:
           # 1s against a measured normal of 0.090s: twelve times normal,
           # not a hair trigger.
           - alert: SiteLatencyHigh
+            #
+            # Same traffic guard as SiteErrorsHigh: a p95 computed from
+            # two requests is noise, not a percentile.
             expr: >
               histogram_quantile(0.95, sum by (le) (rate(
                 traefik_service_request_duration_seconds_bucket{service=~"laravel-spa-laravel-spa-https-.*"}[5m]
               ))) > 1
+              and
+              sum(rate(traefik_service_requests_total{service=~"laravel-spa-laravel-spa-https-.*"}[5m])) > 1
             for: 5m
             labels: { severity: critical }
             annotations:
               summary: "Site p95 latency {{ $value | humanizeDuration }} (normal is 0.090s)"
               runbook: "Check Live site dashboard. If app CPU is low and latency is high it is an I/O stall, not load -- look at mysql threads_running and Dragonfly before adding pods."
 
+          # THE `> 1` GUARD IS THE POINT OF THIS RULE, not the 2%.
+          #
+          # This fired pending on its first night against 0.007 req/s of
+          # maintenance-page traffic: one 503 out of two requests is a 50%
+          # error rate, and a 503 is the correct response for a
+          # maintenance page. clamp_min stops division by zero and does
+          # nothing whatever about a meaningless denominator.
+          #
+          # A ratio needs enough events to mean something. Below 1 req/s
+          # it does not, and a launch starts below 1 req/s -- so without
+          # this guard the alert would cry wolf through exactly the period
+          # when someone is still deciding whether to trust it.
+          #
+          # A site that is DOWN rather than erroring produces no traffic
+          # at all and so cannot trip this. That is what
+          # AppPodsUnavailable and DatabaseUnreachable are for.
           - alert: SiteErrorsHigh
             expr: >
-              (sum(rate(traefik_service_requests_total{service=~"laravel-spa-laravel-spa-https-.*",code=~"5.."}[5m])) or vector(0))
-              / clamp_min(sum(rate(traefik_service_requests_total{service=~"laravel-spa-laravel-spa-https-.*"}[5m])), 0.001) > 0.02
+              (
+                (sum(rate(traefik_service_requests_total{service=~"laravel-spa-laravel-spa-https-.*",code=~"5.."}[5m])) or vector(0))
+                / clamp_min(sum(rate(traefik_service_requests_total{service=~"laravel-spa-laravel-spa-https-.*"}[5m])), 0.001) > 0.02
+              )
+              and
+              sum(rate(traefik_service_requests_total{service=~"laravel-spa-laravel-spa-https-.*"}[5m])) > 1
             for: 5m
             labels: { severity: critical }
             annotations:
