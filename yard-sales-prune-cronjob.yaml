@@ -28,6 +28,36 @@ spec:
               envFrom:
                 - secretRef:
                     name: laravel-spa-secrets
+              # Capped, matching what the cluster has actually been
+              # running. `kubectl apply` does not clear a field a
+              # manifest omits, so these values survived in the live
+              # CronJob long after the file stopped naming them -- the
+              # trap worth remembering (same as `args: []` in
+              # redis.yaml). The earlier fix wrote `resources: {}` to
+              # make the file honest, but that resolves the mismatch by
+              # DELETING the cap instead of recording it.
+              #
+              # Recording it is the better half of that trade. Measured
+              # 2026-10-21: three consecutive runs completed exit 0 at
+              # these limits, and yard_sales currently holds 0 rows, so
+              # the cap costs nothing.
+              #
+              # The note that used to live here argued a 250m cap would
+              # make a 98,212-row backlog crawl. That was about
+              # listings:prune-expired -- a different command, in a
+              # different job -- and the backlog is gone regardless:
+              # the synthetic purge left 2 listings.
+              #
+              # If this job ever gets slow, raise the number here and
+              # apply, rather than removing the cap. Note the command
+              # does YardSale::all(), so memory scales with row count.
+              resources:
+                limits:
+                  cpu: 250m
+                  memory: 256Mi
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
               securityContext:
                 allowPrivilegeEscalation: false
                 runAsNonRoot: true

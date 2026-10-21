@@ -34,6 +34,32 @@
 #    test@example.com, 10 on cranberian8@gmail.com) are not migrated --
 #    but keeping them in place means they can still be extracted by hand
 #    later if that ever matters, instead of being overwritten now.
+#
+# THE VOLUME CLAIM LIVES HERE (moved 2026-10-21)
+#
+# It used to be declared only in minio.yaml -- the superseded pre-swap
+# file, which also still declared a `minio` Deployment running real
+# MinIO. That made `kubectl apply -f minio.yaml` a live-data hazard:
+# it would have replaced SeaweedFS with MinIO, pointed it at /data
+# instead of /data/seaweedfs, and taken photo storage down. The drift
+# checker was recommending exactly that command. minio.yaml is gone;
+# the claim it owned is here, so this file is self-contained.
+#
+# The name `minio-data` is historical, for the same reason the Service
+# is still called `minio` -- see decision 1 above.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-data
+  namespace: laravel-spa
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 20Gi
 ---
 apiVersion: apps/v1
 kind: Deployment

@@ -206,11 +206,70 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: laravel-spa-app-clone
-  # Floor of 8 rather than 1: the floor is what meets a burst before any
-  # scaling can happen, and an idle pod costs ~50m. Ceiling of 40 is
-  # bounded by requests -- 40 x 400m is 16 of 63.8 usable worker cores,
-  # leaving room for the ingress and the load generators.
-  minReplicas: 8
+  # Floor of 24, and the floor is the number that matters.
+  #
+  # Measured 2026-10-14: a burst of 10,000 simultaneous arrivals landed
+  # while the HPA had scaled this down to 9 pods during an idle period.
+  # It served 99.3% of them but at a 24-second median. The same burst
+  # against 24 pods served 97.8% at a 16-second median. Scaling cannot
+  # help here -- a burst lands in seconds and a pod needs ~30s to start
+  # and warm -- so whatever the floor happens to be IS the burst
+  # capacity.
+  #
+  # An idle pod costs ~50m of CPU and ~500Mi, so 24 of them is ~1.2
+  # cores and 12Gi on a cluster with 83 cores and 67Gi. That is a cheap
+  # price for not having the first 10,000 visitors of a spike meet a
+  # third of the fleet.
+  minReplicas: 24
+  # CEILING RESTORED TO 40 (2026-10-21), matching the cluster.
+  #
+  # Everything below this paragraph is the reasoning for having had NO
+  # ceiling. It is kept because the arithmetic is still true and still
+  # useful -- but its premise is not. It was written to discover the
+  # hardware's capacity, and capacity testing has since been retired
+  # for good; volume monitoring decides what hardware to add now.
+  #
+  # What changed is who else is on these nodes. When that note was
+  # written the cluster was a test rig. It now serves the live site,
+  # and this clone shares the same five untainted workers. The note's
+  # own closing observation -- no resource requests anywhere, so the
+  # scheduler has no basis on which to refuse a pod -- was an accepted
+  # experimental condition then. With live traffic on the same cores it
+  # is a way for the clone to starve the real site, and no alert would
+  # attribute the damage here.
+  #
+  # So the binding constraint is deliberately a number again. 40 is the
+  # live app's own ceiling, the clone is idle (1m/500m against 24 pods),
+  # and nothing is scheduled that needs more. Raise it deliberately, with
+  # resource requests added at the same time, if a test ever needs it.
+  #
+  # ---- the original note, retained ----
+  #
+  # NO CEILING, in the only sense Kubernetes permits one to be absent.
+  #
+  # maxReplicas is a required field -- an HPA cannot be written without
+  # it -- so "no cap" has to mean "set beyond anything the hardware can
+  # reach", which moves the binding constraint from a number I picked to
+  # the machines themselves.
+  #
+  # Where the hardware actually binds: app pods can only land on the five
+  # untainted workers (cn9 4, icf 4, k27 32, o06 4, u4h 20 = 64 cores);
+  # the three control planes and loadgen are all NoSchedule. The target
+  # below is 500m average per pod, so 64 cores is reached at about 128
+  # pods. 200 is comfortably past that, so the cluster runs out of CPU
+  # before this number is ever consulted.
+  #
+  # 40 was the previous value and it was my guess, not a measurement.
+  # It would have stopped the fleet at roughly a third of what the nodes
+  # can hold and reported that as the system's limit.
+  #
+  # One consequence worth recording, because it is not obvious: with no
+  # resource requests anywhere, the scheduler has no basis on which to
+  # refuse a pod, so it will keep placing them even past the point where
+  # the nodes can feed them. The expectation is that the fleet settles
+  # well below that and serves the traffic; but if a component turns out
+  # to be unable to cope on these terms, the answer is to replace that
+  # component rather than to put the fence back.
   maxReplicas: 40
   # AverageValue, not Utilization.
   #

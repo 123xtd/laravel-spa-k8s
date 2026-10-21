@@ -50,6 +50,27 @@ spec:
               volumeMounts:
                 - name: dump
                   mountPath: /dump
+              # Capped, matching what the cluster has actually been
+              # running. `kubectl apply` does not clear a field a
+              # manifest omits, so these values survived in the live
+              # CronJob long after the file stopped naming them --
+              # the trap worth remembering (same as `args: []` in
+              # redis.yaml). The earlier fix wrote `resources: {}` to
+              # make the file honest, but that resolves the mismatch
+              # by DELETING the cap rather than recording it, which
+              # leaves a runaway backup free to compete with live
+              # traffic. Recording it keeps the honesty AND the cap.
+              #
+              # Measured 2026-10-21: seven consecutive backups
+              # completed exit 0 at these limits, each in 9-16s,
+              # against a 52MB database. No OOMKills.
+              resources:
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
               securityContext:
                 allowPrivilegeEscalation: false
                 runAsNonRoot: true
@@ -88,6 +109,27 @@ spec:
               volumeMounts:
                 - name: dump
                   mountPath: /dump
+              # Capped, matching what the cluster has actually been
+              # running. `kubectl apply` does not clear a field a
+              # manifest omits, so these values survived in the live
+              # CronJob long after the file stopped naming them --
+              # the trap worth remembering (same as `args: []` in
+              # redis.yaml). The earlier fix wrote `resources: {}` to
+              # make the file honest, but that resolves the mismatch
+              # by DELETING the cap rather than recording it, which
+              # leaves a runaway backup free to compete with live
+              # traffic. Recording it keeps the honesty AND the cap.
+              #
+              # Measured 2026-10-21: seven consecutive backups
+              # completed exit 0 at these limits, each in 9-16s,
+              # against a 52MB database. No OOMKills.
+              resources:
+                limits:
+                  cpu: 250m
+                  memory: 256Mi
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
               securityContext:
                 allowPrivilegeEscalation: false
                 runAsNonRoot: true

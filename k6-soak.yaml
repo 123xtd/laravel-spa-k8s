@@ -154,11 +154,33 @@ metadata:
     role: readers
 spec:
   serviceName: k6-soak
-  # THE LIVE THROTTLE. 6 sessions/sec each, so this is 48/sec site-wide.
-  # Deliberately the low end: the staircase showed 48 and 90 comfortable,
-  # 132 the last good step, 174 a cliff. Start known-good, climb with
-  # `kubectl scale`, watch Grafana. Hard cap 12 -- see the arithmetic.
-  replicas: 8
+  # SCALED TO ZERO 2026-10-21, and it must be resumed deliberately.
+  #
+  # Two reasons, either one sufficient:
+  #
+  # 1. The clone shares the LIVE database. Both laravel-spa-app and
+  #    laravel-spa-app-clone load the same laravel-spa-secrets with no
+  #    DB_* overrides, so they share one database, one Redis and one S3
+  #    bucket. A write persona here does not write to a test site -- it
+  #    writes real rows that appear as real ads on the live site. That
+  #    is the thing we were explicitly asked to stop. The clone needs
+  #    its own database before this rig runs again.
+  #
+  # 2. Capacity testing is retired. Volume monitoring decides hardware
+  #    now; the rig is for testing code changes, not for finding a
+  #    ceiling, so there is no reason for it to be running by default.
+  #
+  # The cluster has had these at 0 since 2026-10-15. The file said 8
+  # and 1, which made `kubectl apply -f k6-soak.yaml` -- a command the
+  # drift checker recommends -- enough to resume load against live data
+  # with no further confirmation. Leaving the numbers here as 0 is what
+  # makes that safe; the original sizing notes are kept below.
+  #
+  # THE LIVE THROTTLE when resumed. 6 sessions/sec each, so 8 would be
+  # 48/sec site-wide. Deliberately the low end: the staircase showed 48
+  # and 90 comfortable, 132 the last good step, 174 a cliff. Scale up
+  # with `kubectl scale`, watch Grafana. Hard cap 12 -- see arithmetic.
+  replicas: 0
   podManagementPolicy: Parallel
   selector:
     matchLabels:
@@ -340,10 +362,14 @@ metadata:
     role: writer
 spec:
   serviceName: k6-soak
-  # ONE, and it must stay one. The rates below are site-wide absolutes;
-  # two writers would double the write load, and the rare personas would
-  # not even double cleanly because of the integer-rate floor.
-  replicas: 1
+  # ZERO -- see the note on k6-soak-readers above. This one writes to the
+  # LIVE database, so it is the more consequential of the two.
+  #
+  # When resumed it is ONE, and it must stay one. The rates below are
+  # site-wide absolutes; two writers would double the write load, and the
+  # rare personas would not even double cleanly because of the
+  # integer-rate floor.
+  replicas: 0
   podManagementPolicy: Parallel
   selector:
     matchLabels:
