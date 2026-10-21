@@ -15,3 +15,26 @@ metadata:
 spec:
   ipAddressPools:
     - default-pool
+  # Never announce from a load-generator box.
+  #
+  # In layer-2 mode exactly one node answers ARP for each LB address and
+  # MetalLB re-elects whenever speakers come and go. With no selector here
+  # every speaker is a candidate, `loadgen` included -- and the speaker
+  # DaemonSet tolerates all taints, so the dedicated-node taint does not
+  # keep it out.
+  #
+  # If loadgen were elected for 192.168.100.200, every request in a load
+  # test would enter the cluster through the generator's own 1 GbE port
+  # and then be forwarded to a Traefik pod on another node. The generator
+  # would be carrying the traffic twice on a single interface, and the
+  # test would be measuring that interface rather than the site. Worse,
+  # the election can change mid-run, so a test could silently start
+  # measuring something different half way through.
+  #
+  # `DoesNotExist` rather than naming the other nodes: it keeps working
+  # when nodes are added, and any future generator box labelled
+  # workload=loadtest is excluded automatically.
+  nodeSelectors:
+    - matchExpressions:
+        - key: workload
+          operator: DoesNotExist

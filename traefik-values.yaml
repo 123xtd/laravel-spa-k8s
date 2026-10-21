@@ -55,6 +55,39 @@ deployment:
 autoscaling:
   enabled: true
   minReplicas: 3
+  # No ceiling, same reasoning as the app HPA: maxReplicas is a required
+  # field, so "uncapped" means set past what the hardware can reach and
+  # let the machines be the limit.
+  #
+  # Traefik is the case where extra pods genuinely help rather than just
+  # dividing a fixed pool. Its memory is dominated by per-connection
+  # buffers, and the total number of connections is set by traffic, not
+  # by pod count -- so spreading the same connections across more pods
+  # lowers the memory each one needs instead of multiplying it. One pod
+  # peaked at 2,751Mi under load; that is the figure that comes DOWN as
+  # this number goes up.
+  #
+  # 12 was my guess and would have bound long before the five untainted
+  # workers ran out of anything.
+  #
+  # BACK TO 12 (2026-10-21), matching the live HPA -- the 60 above was
+  # never applied, so this file has been describing a cluster that does
+  # not exist. Helm manages Traefik, so drift-check.sh cannot see this
+  # one; it was found by reading the live HPA directly.
+  #
+  # The per-connection-buffer reasoning above is right, and the 2,751Mi
+  # figure is measured. The arithmetic around it was not. The five
+  # untainted workers allocate 66.8 GiB in total; 60 pods at that
+  # measured peak would want 165 GiB, two and a half times the whole
+  # cluster. Traefik runs with no memory request, so the scheduler has
+  # nothing to refuse them with -- "let the machines be the limit" would
+  # be reached by exhausting node memory and killing kubelets, which is
+  # how loadgen was lost, not by pods failing to schedule.
+  #
+  # 12 pods at the same peak is 33 GiB, already half the cluster, and
+  # live currently sits at 3 pods on 2m of CPU. Raise this deliberately,
+  # with a memory request added at the same time, if real traffic ever
+  # asks for it.
   maxReplicas: 12
   # AverageValue rather than Utilization: utilisation is a percentage of
   # the REQUEST, and nothing is reserved any more, so a percentage has

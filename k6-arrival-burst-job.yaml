@@ -122,8 +122,22 @@ metadata:
   name: k6-arrival-burst
   namespace: laravel-spa
 spec:
-  parallelism: 8
-  completions: 8
+  # Twelve generators on one 8-thread box. See the long note in
+  # k6-journey-job.yaml: the reason is connection-pool spread, not
+  # capacity. Each k6 process has its own HTTP/2 connection pool with a
+  # per-connection stream limit, so too few processes make requests queue
+  # inside the generator -- and k6 records that queueing as server
+  # latency. Twelve pools and twelve pod IPs keep the arrivals spread
+  # instead of lined up behind each other.
+  #
+  # This matters more here than in the journey test, not less: a burst is
+  # a thundering herd by construction, so every VU tries to send at the
+  # same instant and the pool is the first thing to bottleneck.
+  #
+  # GOMAXPROCS=2 is set below so 12 processes run ~24 threads over 8
+  # cores rather than ~96.
+  parallelism: 12
+  completions: 12
   backoffLimit: 0
   template:
     metadata:
@@ -131,26 +145,29 @@ spec:
         app: k6-arrival-burst
     spec:
       restartPolicy: Never
-      affinity:
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-              - matchExpressions:
-                  - key: kubernetes.io/hostname
-                    operator: In
-                    values:
-                      - talos-cn9-j91
-                      - talos-icf-5wi
-                      - talos-o06-xjv
-                      - talos-k27-emb
-                      - talos-u4h-61d
-      topologySpreadConstraints:
-        - maxSkew: 1
-          topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: ScheduleAnyway
-          labelSelector:
-            matchLabels:
-              app: k6-arrival-burst
+      # The dedicated generator box, and nowhere else.
+      #
+      # Every previous run put generators on the same nodes as the pods
+      # under test -- k27 and u4h between them hosted 21 of the 24 app
+      # pods -- so the generator was taking CPU and memory from the thing
+      # it was measuring, and the kernel OOMKilled generators twice. Every
+      # number from those runs understates capacity by an unknown amount.
+      #
+      # `loadgen` (192.168.100.102) carries nothing else: it is labelled
+      # workload=loadtest and tainted dedicated=loadtest:NoSchedule, so
+      # the selector finds it and the taint keeps app pods, Longhorn and
+      # the exporters off it. The toleration below is what lets these
+      # pods past that taint -- without it they stay Pending.
+      #
+      # The spread constraint that used to be here is gone: there is one
+      # eligible node, so there is nothing to spread across.
+      nodeSelector:
+        workload: loadtest
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: loadtest
+          effect: NoSchedule
       containers:
         - name: k6
           image: grafana/k6:latest
@@ -160,20 +177,54 @@ spec:
               value: "www.foasfo.ca"
             - name: LB_IP
               value: "192.168.100.200"
+            # Pinned, and load-bearing at 12 generators: without it each
+            # k6 process sees all 8 CPUs and starts 8 scheduler threads.
+            - name: GOMAXPROCS
+              value: "2"
+            # Must match `parallelism` above -- the script multiplies by
+            # this to report site-wide arrival counts, so a mismatch
+            # silently misreports every row of the results table.
             - name: GENERATORS
-              value: "8"
+              value: "12"
             - name: AUTH
               valueFrom:
                 secretKeyRef:
                   name: loadtest-credentials
                   key: BASIC_AUTH
-            # Per generator; x8 for site-wide. 2k / 5k / 10k / 20k / 40k
-            # simultaneous arrivals. Deliberately climbs past where it is
-            # expected to break.
+            # Per generator; x12 for site-wide. 5,040 / 10,080 / 12,000 /
+            # 15,960 simultaneous arrivals.
+            #
+            # k6 pre-allocates every VU at startup and this script costs
+            # ~0.8 MB per VU, so the generator's memory IS the arrival
+            # ceiling:
+            #
+            #   loadgen usable RAM    ~14 GB  (16 less Talos + kubelet)
+            #   12 Go runtimes        ~0.8 GB
+            #   -> ~16,250 VUs, so the ladder stops at 15,960
+            #
+            # Shorter at the top than the ladder it replaces, which went
+            # to 30,000 across eight generators on five cluster nodes
+            # totalling 48 GB. One 16 GB box reaches about half that.
+            #
+            # What it buys instead is that the numbers mean something.
+            # k27 and u4h hosted 21 of the 24 pods under test, so every
+            # earlier figure was taken while the generator and the site
+            # fought over the same cores, and generators were OOMKilled
+            # twice mid-run. 10,080 is kept because it brackets the row
+            # that matters (10,000 served at 99.28%), and 15,960 pushes
+            # into the 10k-20k band where the break is expected.
+            #
+            # Raising it further means RAM in loadgen, nothing else: two
+            # free DIMM slots, 64 GB maximum, which would put the ceiling
+            # near 70,000. That is the "add resources" answer, and it
+            # applies to the test rig rather than the site.
             - name: BURST_SIZES
-              value: "250,625,1250,2500,5000"
+              value: "420,840,1000,1330"
+            # 180s: at the ~400/sec drain rate observed for guest
+            # arrivals, 60,000 needs ~150s to clear. Anything shorter
+            # measures the clock.
             - name: BURST_GAP
-              value: "90"
+              value: "180"
           volumeMounts:
             - name: script
               mountPath: /scripts
