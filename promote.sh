@@ -76,6 +76,22 @@ clone_digest() {
 # script has no reason to keep firing the gun that caused an outage.
 TRAEFIK_SVC_IP="${TRAEFIK_SVC_IP:-$(kubectl get svc traefik -n traefik-system -o jsonpath='{.spec.clusterIP}' 2>/dev/null)}"
 
+# A bare `kubectl run` trips the cluster's `restricted` PodSecurity
+# default on all four of its rules, so each probe prints a warning. It is
+# a WARNING only -- no namespace sets pod-security.kubernetes.io/enforce,
+# so the pod is admitted and the gate works. Left as-is on purpose.
+#
+# Tried and reverted 2026-10-21: adding --overrides with a compliant
+# securityContext BREAKS the probe. `kubectl run` names the container
+# after the pod, so a container named anything else is "not found" when
+# kubectl attaches, and the override replaces the container spec
+# wholesale, dropping the curl arguments with it. The failure is silent
+# in the way that matters: probe returns an empty string, which this
+# script reads as "not 200" and refuses to promote a healthy site.
+#
+# If enforcement is ever switched on, build the override JSON with the
+# container name set to the generated pod name AND the command included.
+# Do not bolt a securityContext onto this call and assume it worked.
 probe() {
   kubectl run "promote-probe-$RANDOM" -n "$NS" --rm -i --restart=Never \
     --image=curlimages/curl:latest --command -- "$@" 2>/dev/null \
