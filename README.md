@@ -45,6 +45,7 @@ from here.
 | `promote.sh` | the four-step deploy: pull `:latest` onto the clone, check it, bump the live digest, verify both hostnames over real HTTPS |
 | `drift-check.sh` | every manifest vs the live cluster, and vs git. Run it before trusting any measurement |
 | `uptime-probe.sh` | **runs on jupiter, not in the cluster** — see below |
+| `cert-renewal-watch.sh` | also on jupiter — reports whether the live TLS certificate actually renewed |
 
 ## Two things that will surprise you
 
@@ -102,6 +103,37 @@ Four things worth knowing:
 Config: webhook at `~/.config/basp-uptime/discord-webhook` (0600, read
 from a file so it never appears in `ps`); state and log under
 `~/.local/state/basp-uptime/`.
+
+### TLS renewal is watched, not assumed
+
+`cert-renewal-watch.sh` runs daily at 09:00 Central from the same
+crontab. It reads the live `buyandsellpage-cert` and speaks up three
+times at most per cycle: 4 days before renewal is due, then either a
+confirmation when the revision moves or a warning if the date passes and
+it does not.
+
+It reports the *event*, not a date. A calendar reminder fires whether or
+not anything happened and recurs on a date that stops meaning anything
+after the first renewal.
+
+It exists because of a specific unverified risk. The ACME HTTP-01 path
+has not been exercised since go-live rerouted Traefik on 2026-10-20 — the
+last successful issuance was 2026-09-13, under the old routing. What was
+checked and is fine: cert-manager is healthy, the issuer is Ready against
+the production endpoint, Traefik does run
+`--providers.kubernetesingress` (without it the solver's Ingress would be
+ignored and renewal would fail silently), and there is **no**
+entrypoint-level HTTPS redirect, so the solver's own router does not
+inherit `redirect-to-https`. What was *not* settled: Traefik ranks routers
+by rule length, the live HTTP route's rule is 122 characters and a
+challenge route's is about 114, so which one takes the challenge request
+is unmeasured. Settling it properly needs a throwaway certificate issued
+against the live hostnames.
+
+Backstops, both verified to have live data rather than just existing:
+Prometheus `TLSCertificateExpiringSoon` (< 14 days; its metric
+`traefik_tls_certs_not_after` currently reads 51.6 days) and
+`uptime-probe.sh`, which warns at the same threshold from outside.
 
 **The gap that remains:** jupiter shares a building, a power supply and an
 uplink with the cluster. A failure of any of those is invisible to both,
