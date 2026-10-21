@@ -106,8 +106,14 @@ from a file so it never appears in `ps`); state and log under
 
 ### TLS renewal is watched, not assumed
 
-`cert-renewal-watch.sh` runs daily at 09:00 Central from the same
-crontab. It reads the live `buyandsellpage-cert` and speaks up three
+`cert-renewal-watch.sh` runs daily from the same crontab, at 15:00 UTC
+— which is 09:00 Central on 2026-11-12, the date that matters, and
+10:00 Central during CDT. The hour is written in UTC on purpose: this is
+Debian's cron (3.0pl1), which does **not** support `CRON_TZ` (that is a
+cronie feature, and `man 5 crontab` here never mentions it). A `CRON_TZ`
+line is silently accepted as an ordinary environment variable and
+changes nothing, so it would have run at 03:00 Central under a comment
+claiming 09:00. It reads the live `buyandsellpage-cert` and speaks up three
 times at most per cycle: 4 days before renewal is due, then either a
 confirmation when the revision moves or a warning if the date passes and
 it does not.
