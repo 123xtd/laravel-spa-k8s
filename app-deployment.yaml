@@ -75,7 +75,7 @@ spec:
           # nothing in the manifest to show it. The clone stays on
           # :latest and picks up each build; promoting is the deliberate
           # act of moving this line.
-          image: ghcr.io/123xtd/laravel-spa-app@sha256:5eaeb409fe3a4c95d778a7c3f08470886b6be0ce09cc821e60a9e1fb2a0280b5
+          image: ghcr.io/123xtd/laravel-spa-app@sha256:2ebf41cfda0d65063a1311f86d7fc0c09c435b47eba52ae1472a6ab2c56aa5f2
           ports:
             - containerPort: 8080
           envFrom:
@@ -357,6 +357,14 @@ apiVersion: traefik.io/v1alpha1
 kind: IngressRoute
 metadata:
   name: laravel-spa-https
+  # Promotion log (the digest itself lives on the Deployment above).
+  # Each one was validated on the clone first, as every promotion should be.
+  #   2026-10-21  7040efd0  right-aligned container labels; ticker no
+  #                         longer scrolling blank space
+  #   2026-10-21  2ebf41cf  mobile text wrapping on every starship --
+  #                         measured clean at 375/390/768 on both
+  #                         hostnames; .npmrc now honoured in the builds
+  #
   # WENT LIVE 2026-10-20. Both routes pointed at maintenance-page until
   # now; apex and www now serve the app.
   #

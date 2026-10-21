@@ -54,12 +54,43 @@ clone_digest() {
   kubectl get pods -n "$NS" -l app=laravel-spa-app-clone \
     -o jsonpath='{.items[0].status.containerStatuses[0].imageID}' | sed 's/.*@//'
 }
-serves_200() {
-  local svc="$1" host="$2"
+# Two probes, because the clone and the live site are reached differently.
+#
+# serves_200_internal talks straight to a ClusterIP service with a Host
+# header. It is the only way to check the clone: the clone's Basic Auth is
+# a Traefik middleware, so a request arriving through the ingress gets a
+# 401 and the check would report a broken site that is in fact fine.
+#
+# serves_200_public goes through Traefik over real TLS, pinned to Traefik's
+# ClusterIP with --resolve so it does not depend on the cluster being able
+# to hairpin its own public address. Certificate verification stays ON --
+# an expired cert SHOULD fail a promotion.
+#
+# Live is checked the public way on purpose. The plaintext probe only ever
+# proved "the app pod answers": it says nothing about TLS, the certificate,
+# the IngressRoute or the redirect middlewares, any one of which can break
+# a promotion by itself. It is also the exact shape of request that once
+# poisoned the page cache with an http:// render -- the cache key carries
+# no scheme, so a single plaintext fetch of / could then be served to every
+# HTTPS visitor. URL::forceScheme('https') defuses that now, but a deploy
+# script has no reason to keep firing the gun that caused an outage.
+TRAEFIK_SVC_IP="${TRAEFIK_SVC_IP:-$(kubectl get svc traefik -n traefik-system -o jsonpath='{.spec.clusterIP}' 2>/dev/null)}"
+
+probe() {
   kubectl run "promote-probe-$RANDOM" -n "$NS" --rm -i --restart=Never \
-    --image=curlimages/curl:latest --command -- \
-    curl -s -o /dev/null -w '%{http_code}' -H "Host: $host" "http://$svc/" 2>/dev/null \
+    --image=curlimages/curl:latest --command -- "$@" 2>/dev/null \
     | grep -oE '^[0-9]{3}' | head -1
+}
+
+serves_200_internal() {
+  local svc="$1" host="$2"
+  probe curl -s -o /dev/null -w '%{http_code}' -H "Host: $host" "http://$svc/"
+}
+
+serves_200_public() {
+  local host="$1"
+  [ -n "$TRAEFIK_SVC_IP" ] || die "could not find Traefik's ClusterIP, so the live site cannot be checked over HTTPS."
+  probe curl -s -o /dev/null -w '%{http_code}' --resolve "$host:443:$TRAEFIK_SVC_IP" "https://$host/"
 }
 
 # ---- 1. is there anything to promote? ----
@@ -94,7 +125,7 @@ if [ "$NEW" = "$BEFORE" ]; then
 fi
 
 # ---- 4. does it serve? ----
-code=$(serves_200 laravel-spa-app-clone www.foasfo.ca)
+code=$(serves_200_internal laravel-spa-app-clone www.foasfo.ca)
 [ "$code" = "200" ] || die "the clone answers HTTP $code, not 200. Not promoting that. Live is untouched."
 say "  clone serves HTTP 200"
 
@@ -138,9 +169,9 @@ kubectl run "promote-cc-$RANDOM" -n "$NS" --rm -i --restart=Never --image="$IMAG
 say ""
 say "=== 8. live ==="
 for host in buyandsellpage.ca buyandsellpage.com; do
-  c=$(serves_200 laravel-spa-app "$host")
-  say "  $host -> HTTP $c"
-  [ "$c" = "200" ] || die "$host answers $c. Roll back with: kubectl -n $NS rollout undo deployment/laravel-spa-app"
+  c=$(serves_200_public "$host")
+  say "  $host -> HTTPS $c"
+  [ "$c" = "200" ] || die "$host answers $c over HTTPS. Roll back with: kubectl -n $NS rollout undo deployment/laravel-spa-app"
 done
 
 say ""
