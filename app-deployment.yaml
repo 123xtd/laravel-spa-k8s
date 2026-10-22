@@ -87,6 +87,27 @@ spec:
           # which skips the search list regardless of ndots -- belt and
           # braces alongside the dnsConfig above.
           env:
+            # What the browser tab says. Deliberately NOT APP_NAME:
+            # config/mail.php falls back to APP_NAME for the outgoing
+            # email sender name, and TwoFactorAuthenticationService
+            # passes it as the issuer shown in people's authenticator
+            # apps. Renaming the tab should rename neither.
+            #
+            # This is an `env` entry while APP_NAME arrives via
+            # `envFrom`, and that is load-bearing: env takes precedence
+            # over envFrom, which is how this wins without editing the
+            # shared secret both app tiers read.
+            #
+            # Shared to the frontend as the `tabName` prop, so one image can
+            # serve both tiers under different names. Do NOT move this to
+            # VITE_APP_NAME: vite resolves that at build time, so both
+            # tiers would get whichever name was built, and that is how
+            # the tab ended up saying "Laravel" in the first place.
+            #
+            # This value is the real site: a label a visitor will recognise in
+            # their bookmarks and history a month from now.
+            - name: APP_TAB_NAME
+              value: "Buy and Sell Page"
             - name: REDIS_HOST
               value: redis.laravel-spa.svc.cluster.local.
             # The root cause behind most 500s under load. With
