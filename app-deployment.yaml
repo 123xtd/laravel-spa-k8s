@@ -75,7 +75,7 @@ spec:
           # nothing in the manifest to show it. The clone stays on
           # :latest and picks up each build; promoting is the deliberate
           # act of moving this line.
-          image: ghcr.io/123xtd/laravel-spa-app@sha256:2ebf41cfda0d65063a1311f86d7fc0c09c435b47eba52ae1472a6ab2c56aa5f2
+          image: ghcr.io/123xtd/laravel-spa-app@sha256:cd664c7f5e7095f6b27a1aea1211ff5ba9db3f8ec90f051e650e15bf8b9d9906
           ports:
             - containerPort: 8080
           envFrom:
