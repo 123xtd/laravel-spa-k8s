@@ -109,6 +109,26 @@ serves_200_public() {
   probe curl -s -o /dev/null -w '%{http_code}' --resolve "$host:443:$TRAEFIK_SVC_IP" "https://$host/"
 }
 
+# Clear a tier's page cache.
+#
+# $1/$2 are the Redis session/cache db numbers, because the two tiers do
+# not share them: live is 0/1, the clone is 2/3 (set in app-clone.yaml).
+# laravel-spa-secrets names live's, so clearing the clone needs both
+# overridden or it would clear live's cache and leave the clone's stale.
+#
+# This matters for --clone especially. Pulling a new image onto the clone
+# does NOT invalidate what CacheGuestPage already stored, so the "look at
+# the clone before promoting" step was serving pre-change HTML -- someone
+# could approve a deploy having reviewed the old page. Found 2026-10-22
+# when a tab title kept reading the old value out of a pod whose env and
+# config had both already changed.
+clear_page_cache() {
+  local session_db="$1" cache_db="$2"
+  kubectl run "promote-cc-$RANDOM" -n "$NS" --rm -i --restart=Never --image="$IMAGE:latest" \
+    --overrides="{\"spec\":{\"imagePullSecrets\":[{\"name\":\"ghcr-pull-secret\"}],\"containers\":[{\"name\":\"runner\",\"image\":\"$IMAGE:latest\",\"workingDir\":\"/var/www/html\",\"command\":[\"php\",\"artisan\",\"cache:clear\"],\"envFrom\":[{\"secretRef\":{\"name\":\"laravel-spa-secrets\"}}],\"env\":[{\"name\":\"REDIS_DB\",\"value\":\"$session_db\"},{\"name\":\"REDIS_CACHE_DB\",\"value\":\"$cache_db\"}]}]}}" \
+    2>/dev/null | grep -iE "cleared|error" | sed 's/^/  /'
+}
+
 # ---- 1. is there anything to promote? ----
 say ""
 say "=== 1. app repo ==="
@@ -147,6 +167,11 @@ say "  clone serves HTTP 200"
 
 if [ "$CLONE_ONLY" -eq 1 ]; then
   say ""
+  say "=== clearing the clone's page cache ==="
+  say "    without this the clone serves HTML rendered before this image,"
+  say "    so what you review is not what you would be promoting."
+  clear_page_cache 2 3
+  say ""
   say "=== stopping here (--clone). Live still on ${BEFORE:0:19} ==="
   say "    look at https://www.foasfo.ca then re-run without --clone"
   exit 0
@@ -177,9 +202,7 @@ say "  rolled out"
 # ---- 7. the step that makes a good deploy look broken ----
 say ""
 say "=== 7. clearing the page cache ==="
-kubectl run "promote-cc-$RANDOM" -n "$NS" --rm -i --restart=Never --image="$IMAGE:latest" \
-  --overrides="{\"spec\":{\"imagePullSecrets\":[{\"name\":\"ghcr-pull-secret\"}],\"containers\":[{\"name\":\"runner\",\"image\":\"$IMAGE:latest\",\"workingDir\":\"/var/www/html\",\"command\":[\"php\",\"artisan\",\"cache:clear\"],\"envFrom\":[{\"secretRef\":{\"name\":\"laravel-spa-secrets\"}}]}]}}" \
-  2>/dev/null | grep -iE "cleared|error" | sed 's/^/  /'
+clear_page_cache 0 1
 
 # ---- 8. is the live site actually up? ----
 say ""
