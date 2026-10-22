@@ -41,6 +41,14 @@ HOSTS=("buyandsellpage.ca:ca" "buyandsellpage.com:com")
 CONTROL_URL="https://www.google.com/generate_204"
 
 TIMEOUT=20                 # seconds per request
+
+# Identify this probe in the access logs so its traffic can be excluded
+# from any view count. It runs every 5 minutes against two hostnames,
+# which is 576 requests a day -- enough to dwarf real traffic on a new
+# site and make a chart look like discovery when it is just monitoring.
+# A default curl/x.y UA is indistinguishable from the scanners that
+# arrive within seconds of a certificate hitting the public CT logs.
+UA="BASP-UptimeProbe/1.0 (+internal monitoring from jupiter; not a visitor)"
 FAIL_THRESHOLD=2           # consecutive bad runs before alerting (~10 min at */5)
 REMIND_EVERY=12            # while still down, re-alert every N runs (~1 hour)
 CERT_WARN_DAYS=14
@@ -102,7 +110,7 @@ check_host() {
   local host="$1" want_region="$2"
   local body code
 
-  body=$(curl -s --max-time "$TIMEOUT" -w '\n%{http_code}' "https://$host/" 2>/dev/null)
+  body=$(curl -s --max-time "$TIMEOUT" -A "$UA" -w '\n%{http_code}' "https://$host/" 2>/dev/null)
   if [ -z "$body" ]; then
     problems+=("$host: no response at all (DNS, TCP or TLS failed)")
     return
@@ -158,7 +166,7 @@ done
 
 # ------------------------------------------- is it the site, or just me?
 if [ ${#problems[@]} -gt 0 ]; then
-  if ! curl -s -o /dev/null --max-time "$TIMEOUT" "$CONTROL_URL" 2>/dev/null; then
+  if ! curl -s -o /dev/null --max-time "$TIMEOUT" -A "$UA" "$CONTROL_URL" 2>/dev/null; then
     # No internet from this box. Saying "the site is down" would be a
     # guess, and a wrong one often enough to train you to ignore it.
     log "LOCAL: ${#problems[@]} check(s) failed AND the control URL is unreachable -- treating as a local network fault, not alerting"
