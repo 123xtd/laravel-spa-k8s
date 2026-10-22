@@ -54,7 +54,17 @@ else
 fi
 
 say "allowing connections from the cluster"
-CNF=/etc/mysql/mysql.conf.d/99-basp-dev.cnf
+# zz- and NOT 99-, which is the obvious-looking mistake and the one this
+# script shipped with.
+#
+# MySQL reads an !includedir in ALPHABETICAL order and the last setting
+# wins. Ubuntu's own /etc/mysql/mysql.conf.d/mysqld.cnf already contains
+# `bind-address = 127.0.0.1`, and digits sort BEFORE letters, so a file
+# named 99-*.cnf is read first and then overridden straight back to
+# localhost by mysqld.cnf. The script reported success -- it had written
+# the file -- while 3306 stayed shut, which is the worst kind of failure
+# because nothing complains.
+CNF=/etc/mysql/mysql.conf.d/zz-basp-dev.cnf
 if [ -f "$CNF" ] && grep -q "bind-address" "$CNF"; then
   echo "   $CNF already present"
 else
@@ -69,6 +79,16 @@ EOF
 fi
 sudo systemctl restart mysql
 sudo systemctl is-active mysql | sed 's/^/   mysql is /'
+
+# Check what mysql ACTUALLY bound to, not what we asked for. See the note
+# on CNF above for why those two can differ silently.
+BOUND=$(sudo mysql -N -B -e "SELECT @@bind_address" 2>/dev/null || echo "?")
+echo "   bind_address is now: ${BOUND}"
+if [ "$BOUND" = "127.0.0.1" ] || [ "$BOUND" = "localhost" ]; then
+  echo "   STILL LOCALHOST-ONLY. Something later in the include order is"
+  echo "   overriding ${CNF}. Check with:  grep -rn bind-address /etc/mysql/"
+  exit 1
+fi
 
 say "database and user"
 echo "   Choose a password for the '$DB_USER' user."
