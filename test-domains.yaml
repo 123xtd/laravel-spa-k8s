@@ -57,10 +57,34 @@ spec:
   entryPoints:
     - websecure
   routes:
-    - match: Host(`ba-sp.com`) || Host(`foasfo.com`) || Host(`foasfo.ca`)
+    - match: Host(`foasfo.com`) || Host(`foasfo.ca`)
       kind: Rule
       services:
         - name: laravel-spa-app
+          port: 80
+      middlewares:
+        - name: laravel-spa-test-domains-auth
+    # ba-sp.com was moved out of the rule above on 2026-10-23 and now
+    # serves the DEVELOPMENT tier (see app-dev.yaml).
+    #
+    # It was one of three hosts pointing at the live app for no distinct
+    # purpose, while foasfo.com and foasfo.ca carry the A/B comparison and
+    # www.foasfo.ca carries the clone. Reusing it costs nothing: it is
+    # already on laravel-spa-test-domains-cert, already resolves, and is
+    # already behind the Basic Auth wall, so the dev tier needed no new
+    # DNS record and no certificate change.
+    #
+    # Ending in ".com" means Region::current() resolves it to 'com', so
+    # this tier sees the American region. Worth remembering when testing
+    # anything region-dependent -- the regional nudge, contact addresses,
+    # the area picker.
+    #
+    # To retire the dev tier: move ba-sp.com back into the rule above and
+    # delete app-dev.yaml.
+    - match: Host(`ba-sp.com`)
+      kind: Rule
+      services:
+        - name: laravel-spa-app-dev
           port: 80
       middlewares:
         - name: laravel-spa-test-domains-auth
@@ -88,6 +112,11 @@ spec:
       middlewares:
         - name: laravel-spa-test-domains-auth
         - name: compress
+    # Both still redirect to their own apex. www.ba-sp.com therefore ends
+    # up on the dev tier and www.foasfo.com on the live app, which is
+    # correct in each case -- the redirect is per-host, so one rule serves
+    # both. The service named here only has to answer the redirect, which
+    # never reaches the application.
     - match: Host(`www.ba-sp.com`) || Host(`www.foasfo.com`)
       kind: Rule
       services:

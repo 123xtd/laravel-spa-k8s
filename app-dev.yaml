@@ -1,0 +1,222 @@
+# The DEVELOPMENT tier: laravel-spa-app-dev at https://ba-sp.com
+#
+# A third app tier, built for the seller-store work. The point is that
+# nothing it does can reach the live site, which the existing clone could
+# not promise: laravel-spa-app and laravel-spa-app-clone both load
+# laravel-spa-secrets with no DB_* overrides, so they share one database
+# and a test shop created on the clone would appear on buyandsellpage.ca.
+#
+# WHY THE CLONE WAS NOT JUST REPOINTED
+#
+# Deliberate. The clone shares live's database on purpose, so a comparison
+# between the two measures the code change rather than the environment.
+# Giving it its own database would have ended that. The store work gets a
+# separate tier instead and the clone is untouched.
+#
+# WHAT IS ISOLATED, AND WHAT IS NOT
+#
+#   database  OWN   basp_dev on saturn (192.168.100.110), a Mac running
+#                   Ubuntu 26.04 that is not a cluster node. MySQL 8.4.11,
+#                   byte-identical to production's
+#                   8.4.11-0ubuntu0.26.04.1. Credentials in the
+#                   laravel-spa-dev-db secret.
+#   cache     OWN   dragonfly-dev below, not the shared instance. See the
+#                   note on it.
+#   S3        SHARED  still the live bucket, inherited from
+#                   laravel-spa-secrets. A dev product's photos land in
+#                   the real bucket. Nothing links them so no visitor sees
+#                   them, but they are there. Isolating this needs a
+#                   second bucket and an AWS_BUCKET override.
+#   sessions  OWN   dragonfly-dev db 0
+#
+# HOSTNAME
+#
+# ba-sp.com, already on laravel-spa-test-domains-cert, already resolving,
+# already behind the Basic Auth wall. It was previously one of three hosts
+# pointing at the live app for no distinct reason, while foasfo.com and
+# foasfo.ca carry the A/B comparison and www.foasfo.ca is the clone. The
+# routing change lives in test-domains.yaml.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dragonfly-dev
+  namespace: laravel-spa
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dragonfly-dev
+  template:
+    metadata:
+      labels:
+        app: dragonfly-dev
+    spec:
+      containers:
+        - name: dragonfly
+          # Same pinned digest as the shared instance, so dev and live are
+          # not debugging two different cache engines.
+          image: ghcr.io/dragonflydb/dragonfly@sha256:061f00b201b58e12f974e4e96c761a881ee1c05e9d8ee967466a604b7299753b
+          args:
+            - --logtostderr
+            - --port=6379
+            - --cache_mode=true
+            # Two is all this tier uses (0 sessions, 1 cache). The shared
+            # instance runs 16 because three tiers were sharing it.
+            - --dbnum=4
+            - --dbfilename=
+          ports:
+            - containerPort: 6379
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          readinessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 2
+          livenessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 5
+          # Limits here, unlike the shared instance, which runs uncapped.
+          # Uncapped is defensible for something load-bearing; a dev cache
+          # should not be able to take a node down. The ceiling is
+          # deliberately generous rather than derived from idle usage --
+          # the shared instance sits at 169Mi serving 48 pods, and a limit
+          # set near idle is exactly how Traefik got OOMKilled.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dragonfly-dev
+  namespace: laravel-spa
+spec:
+  selector:
+    app: dragonfly-dev
+  ports:
+    - port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: laravel-spa-app-dev
+  namespace: laravel-spa
+spec:
+  # TWO, not the clone's 24. This tier serves one developer, not a load
+  # test. No HPA either -- there is nothing here worth autoscaling.
+  replicas: 2
+  selector:
+    matchLabels:
+      app: laravel-spa-app-dev
+  template:
+    metadata:
+      labels:
+        app: laravel-spa-app-dev
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull-secret
+      containers:
+        - name: app
+          image: ghcr.io/123xtd/laravel-spa-app:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: laravel-spa-secrets
+          env:
+            # DB_* come from `env` rather than a second envFrom, so the
+            # precedence is explicit rather than depending on ordering:
+            # env always beats envFrom. These point at saturn and are the
+            # whole reason this tier exists.
+            - name: DB_HOST
+              valueFrom: { secretKeyRef: { name: laravel-spa-dev-db, key: DB_HOST } }
+            - name: DB_PORT
+              valueFrom: { secretKeyRef: { name: laravel-spa-dev-db, key: DB_PORT } }
+            - name: DB_DATABASE
+              valueFrom: { secretKeyRef: { name: laravel-spa-dev-db, key: DB_DATABASE } }
+            - name: DB_USERNAME
+              valueFrom: { secretKeyRef: { name: laravel-spa-dev-db, key: DB_USERNAME } }
+            - name: DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: laravel-spa-dev-db, key: DB_PASSWORD } }
+            # Its own cache instance, so a `cache:clear` aimed at this tier
+            # cannot wipe live's page cache. That mistake already happened
+            # once in promote.sh, where both tiers pointed at one instance
+            # and only the database number differed.
+            - name: REDIS_HOST
+              value: dragonfly-dev.laravel-spa.svc.cluster.local.
+            - name: REDIS_PERSISTENT
+              value: "true"
+            - name: REDIS_DB
+              value: "0"
+            - name: REDIS_CACHE_DB
+              value: "1"
+            # OFF, deliberately, and this is the one setting most likely to
+            # be questioned.
+            #
+            # CacheGuestPage serves stored HTML, which on a development
+            # tier means your change is invisible until the entry expires.
+            # That cost a real debugging session: a tab title kept reading
+            # the old value from a pod whose env AND config had both
+            # already changed, because the response was cached from
+            # before. Caching is a production concern; measure it there.
+            - name: PAGE_CACHE_ENABLED
+              value: "false"
+            - name: APP_TAB_NAME
+              value: "Basp-Dev"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 15
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 82
+            runAsGroup: 82
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          # Bounded, for the same reason as dragonfly-dev: development must
+          # not be able to starve the live site sharing these nodes. The
+          # memory ceiling sits well above PHP's own memory_limit of 512M
+          # (docker/prod/uploads.ini) so a photo upload decoding a large
+          # JPEG cannot trip the container limit before PHP's own.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: laravel-spa-app-dev
+  namespace: laravel-spa
+spec:
+  selector:
+    app: laravel-spa-app-dev
+  ports:
+    - port: 80
+      targetPort: 8080
