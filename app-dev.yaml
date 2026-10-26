@@ -175,6 +175,26 @@ spec:
             # before. Caching is a production concern; measure it there.
             - name: PAGE_CACHE_ENABLED
               value: "false"
+            # Its own bucket, so a test product's photos stop landing in
+            # the live one. Until now this tier inherited AWS_BUCKET from
+            # laravel-spa-secrets and wrote straight into
+            # laravel-spa-uploads -- invisible to visitors, since nothing
+            # linked them, but accumulating in the real bucket all the
+            # same.
+            #
+            # The SeaweedFS identity carries Admin and is NOT bucket-scoped,
+            # so this separation is by configuration, not by permission. A
+            # bug that hardcoded the live bucket name would still reach it.
+            # Worth knowing before trusting it absolutely.
+            - name: AWS_BUCKET
+              value: "laravel-spa-dev-uploads"
+            # Same CDN host, different path. The host is a Traefik route
+            # onto the same object store, so it serves any bucket; giving
+            # dev its own hostname would need another DNS record and
+            # another certificate for no isolation benefit. The isolation
+            # that was wanted is the bucket, and that is what this is.
+            - name: AWS_URL
+              value: "https://cdn.buyandsellpage.ca/laravel-spa-dev-uploads"
             - name: APP_TAB_NAME
               value: "Basp-Dev"
           readinessProbe:
