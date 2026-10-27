@@ -104,6 +104,42 @@ spec:
               value: "2"
             - name: REDIS_CACHE_DB
               value: "3"
+            # Server-side rendering, ON here and nowhere else yet.
+            #
+            # The SSR tier has been running since before go-live without
+            # ever being asked for anything. There is no
+            # config/inertia.php and this variable was never set, so the
+            # package default applied -- enabled true, url
+            # http://127.0.0.1:13714 -- and the app dialled its OWN pod,
+            # where nothing listens. Proven from inside an app pod on
+            # 2026-10-27: 127.0.0.1:13714 is connection-refused while
+            # laravel-spa-ssr:13714 answers 200. Inertia catches that and
+            # falls back to client rendering, which is why nobody noticed.
+            #
+            # Pointed at the service, the tier finally serves. On the
+            # clone first, because a mismatch between the SSR bundle and
+            # the client bundle shows up as hydration errors rather than
+            # as a clean failure.
+            - name: INERTIA_SSR_URL
+              value: http://laravel-spa-ssr:13714
+            # The SECOND reason SSR never ran, and the quieter one.
+            #
+            # Inertia only dispatches to the SSR server if it can also
+            # find an SSR bundle ON DISK in this container -- it looks
+            # for bootstrap/ssr/ssr.mjs, bootstrap/ssr/ssr.js or
+            # public/js/ssr.js. The app image ships none of them; the
+            # bundle lives in the laravel-spa-ssr image, which is the
+            # whole point of that tier being separate. So the check
+            # failed, dispatch was skipped, and nothing was logged
+            # anywhere: no error, no request, no clue.
+            #
+            # Turning the check off is the right answer here rather than
+            # copying the bundle into the app image: the app does not
+            # execute it, it only needs to know the renderer is out
+            # there, and that is what the health check and the readiness
+            # probe on the SSR tier are for.
+            - name: INERTIA_SSR_ENSURE_BUNDLE_EXISTS
+              value: "false"
             # THE VARIANT UNDER TEST. Set here and nowhere else, so the
             # two tiers run identical code and differ only by this flag
             # -- which is what makes the comparison attributable to the

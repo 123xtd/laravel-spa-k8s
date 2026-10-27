@@ -291,6 +291,26 @@ spec:
           image: ghcr.io/123xtd/laravel-spa-ssr:latest
           ports:
             - containerPort: 13714
+          # The tier had no probe at all, so a pod that was running but
+          # not yet listening -- or one that had fallen over -- still
+          # took traffic. It matters now in a way it did not before:
+          # until 2026-10-27 nothing ever called this tier, so nothing
+          # could notice. @inertiajs/server answers /health with
+          # {"status":"OK"}.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 13714
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 13714
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 3
           envFrom:
             - secretRef:
                 name: laravel-spa-secrets
