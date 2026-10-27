@@ -14,7 +14,9 @@
 #      running -- that means CI has not published yet
 #   4. checks the clone serves 200
 #   5. STOPS for you to look at www.foasfo.ca
-#   6. bumps the digest in app-deployment.yaml and applies it
+#   6. bumps BOTH digests in app-deployment.yaml -- app and SSR -- and
+#      rolls both, because a client bundle and an SSR bundle from
+#      different builds meet in the browser as hydration mismatches
 #   7. banks the Market pulse counts, then clears the page cache, which
 #      otherwise serves the old HTML for up to PAGE_CACHE_TTL (300s) and
 #      makes a good deploy look broken. The banking comes first because
@@ -33,6 +35,7 @@ cd "$(dirname "$0")"
 APP_REPO="${APP_REPO:-../laravel-spa}"
 NS=laravel-spa
 IMAGE=ghcr.io/123xtd/laravel-spa-app
+SSR_IMAGE=ghcr.io/123xtd/laravel-spa-ssr
 MANIFEST=app-deployment.yaml
 
 ASSUME_YES=0
@@ -55,6 +58,21 @@ live_digest() {
 clone_digest() {
   kubectl get pods -n "$NS" -l app=laravel-spa-app-clone \
     -o jsonpath='{.items[0].status.containerStatuses[0].imageID}' | sed 's/.*@//'
+}
+live_ssr_digest() {
+  kubectl get deploy laravel-spa-ssr -n "$NS" \
+    -o jsonpath='{.spec.template.spec.containers[0].image}' | sed 's/.*@//'
+}
+# Sorted by age and taking the LAST, never items[0].
+#
+# Old pods linger in Running while they terminate, so items[0] is
+# routinely a pod on the previous image. Read that way by hand on
+# 2026-10-27, it reported an SSR restart as a no-op when the new pods
+# were already up -- the kind of wrong answer that gets acted on.
+running_ssr_digest() {
+  kubectl get pods -n "$NS" -l app=laravel-spa-ssr \
+    --sort-by=.metadata.creationTimestamp \
+    -o jsonpath='{.items[-1:].status.containerStatuses[0].imageID}' | sed 's/.*@//'
 }
 # Two probes, because the clone and the live site are reached differently.
 #
@@ -209,16 +227,42 @@ if [ "$ASSUME_YES" -eq 0 ]; then
   case "$reply" in [yY]*) ;; *) say "    not promoted. Live still on ${BEFORE:0:19}"; exit 0 ;; esac
 fi
 
-# ---- 6. bump the digest and apply ----
+# ---- 6. bump BOTH digests and apply ----
+#
+# The SSR tier moves with the app tier, and that is not tidiness.
+# Once SSR is serving, the app renders a client bundle from its pinned
+# digest while SSR renders markup from its own; if the two are different
+# builds of the same page they meet in the browser as hydration
+# mismatches. They are promoted together or not at all.
+#
+# SSR is pinned by digest in the manifest, so it cannot pull a new image
+# on its own. To find out what the current build IS, it is pointed at
+# :latest, rolled, and read -- then written back into the manifest as a
+# digest, which is what the apply below re-pins.
 say ""
 say "=== 6. promoting ==="
 grep -q "$IMAGE@$BEFORE" "$MANIFEST" || die "could not find $BEFORE in $MANIFEST. Has it been edited by hand? Not touching it."
+
+BEFORE_SSR=$(live_ssr_digest)
+say "  ssr is running:   ${BEFORE_SSR:0:19}"
+kubectl -n "$NS" set image deployment/laravel-spa-ssr ssr="$SSR_IMAGE:latest" >/dev/null \
+  || die "could not point the SSR tier at :latest."
+kubectl -n "$NS" rollout status deployment/laravel-spa-ssr --timeout=400s >/dev/null \
+  || die "the SSR tier did not come back on :latest. Live is untouched and still on ${BEFORE:0:19}."
+NEW_SSR=$(running_ssr_digest)
+[ -n "$NEW_SSR" ] || die "could not read the SSR tier's digest after rolling it. Live is untouched."
+say "  ssr now running:  ${NEW_SSR:0:19}"
+
 sed -i "s|$IMAGE@$BEFORE|$IMAGE@$NEW|" "$MANIFEST"
-say "  $MANIFEST: ${BEFORE:0:19} -> ${NEW:0:19}"
+sed -i "s|$SSR_IMAGE@[a-z0-9:]*|$SSR_IMAGE@$NEW_SSR|" "$MANIFEST"
+say "  $MANIFEST app: ${BEFORE:0:19} -> ${NEW:0:19}"
+say "  $MANIFEST ssr: ${BEFORE_SSR:0:19} -> ${NEW_SSR:0:19}"
 kubectl apply -f "$MANIFEST" | sed 's/^/  /'
 kubectl -n "$NS" rollout status deployment/laravel-spa-app --timeout=400s >/dev/null \
   || die "the live rollout stalled. The readiness probe is holding old pods in place, so the site is still up on the previous image. Roll back with: kubectl -n $NS rollout undo deployment/laravel-spa-app"
-say "  rolled out"
+kubectl -n "$NS" rollout status deployment/laravel-spa-ssr --timeout=400s >/dev/null \
+  || die "the SSR tier stalled after being re-pinned. The app tier is already on the new image."
+say "  both tiers rolled out"
 
 # ---- 7. the step that makes a good deploy look broken ----
 say ""

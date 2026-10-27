@@ -288,7 +288,18 @@ spec:
         - name: ghcr-pull-secret
       containers:
         - name: ssr
-          image: ghcr.io/123xtd/laravel-spa-ssr:latest
+          # Pinned by digest, exactly like the app tier beside it, and
+          # bumped by promote.sh in the same breath.
+          #
+          # It was :latest, which is a loaded gun once SSR is actually
+          # serving: the app renders a client bundle from its pinned
+          # digest while the SSR tier renders markup from whatever
+          # :latest happens to be, and two different builds of the same
+          # page meet in the browser as hydration mismatches. :latest
+          # also meant `kubectl apply` reported this deployment
+          # unchanged and never rolled it, so it quietly ran whatever it
+          # had pulled whenever it last restarted.
+          image: ghcr.io/123xtd/laravel-spa-ssr@sha256:effa73f4f83da6e2d797c5b6ca0d6e3d6e025f82b707e969d82fc732c8379c5e
           ports:
             - containerPort: 13714
           # The tier had no probe at all, so a pod that was running but
