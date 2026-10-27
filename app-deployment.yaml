@@ -75,7 +75,7 @@ spec:
           # nothing in the manifest to show it. The clone stays on
           # :latest and picks up each build; promoting is the deliberate
           # act of moving this line.
-          image: ghcr.io/123xtd/laravel-spa-app@sha256:2337b918222a513bd89d91ecb840872dddcd987f172df57ab7a2914a63c53bef
+          image: ghcr.io/123xtd/laravel-spa-app@sha256:17b5e1716333cb430fa01f9bbce50f4057dc644290b65d2a4a74f937ea75ef47
           ports:
             - containerPort: 8080
           envFrom:
@@ -312,7 +312,7 @@ spec:
           # also meant `kubectl apply` reported this deployment
           # unchanged and never rolled it, so it quietly ran whatever it
           # had pulled whenever it last restarted.
-          image: ghcr.io/123xtd/laravel-spa-ssr@sha256:effa73f4f83da6e2d797c5b6ca0d6e3d6e025f82b707e969d82fc732c8379c5e
+          image: ghcr.io/123xtd/laravel-spa-ssr@sha256:991cdb8a09f02efe531ac9373af54aa3592df8bf3449e68dc106e00e311bbd77
           ports:
             - containerPort: 13714
           # The tier had no probe at all, so a pod that was running but
