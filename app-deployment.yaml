@@ -275,7 +275,20 @@ metadata:
   name: laravel-spa-ssr
   namespace: laravel-spa
 spec:
-  replicas: 2
+  # 6, with an HPA to 24 below.
+  #
+  # 2 was the number for a tier nothing called. Once SSR is serving, it
+  # is in the path of every page the app tier cannot answer from the
+  # page cache, and the app tier scales 24-40 -- two Node processes
+  # behind forty PHP ones is the narrowest point in the system by a wide
+  # margin.
+  #
+  # These numbers are a starting point, not a measurement: SSR has never
+  # carried traffic here, so there is no observed cost per render to
+  # size against. 6 covers the current baseline with headroom to absorb
+  # a burst before the HPA reacts. Validate with the k6 journey job
+  # against the clone with SSR on, and set them from what that says.
+  replicas: 6
   selector:
     matchLabels:
       app: laravel-spa-ssr
@@ -363,6 +376,58 @@ spec:
   ports:
     - port: 13714
       targetPort: 13714
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: laravel-spa-ssr
+  namespace: laravel-spa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: laravel-spa-ssr
+  minReplicas: 6
+  # 24, which is the app tier's MINIMUM. Rendering a page costs less
+  # than serving the request around it, so SSR should not need to match
+  # the app one for one -- but it must not be the thing that runs out
+  # first, and 24 is the point past which the app tier is already
+  # scaling.
+  maxReplicas: 24
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          # AverageValue, not Utilization, and that is load-bearing:
+          # nothing in this namespace sets CPU requests (see the note on
+          # the app container), and Utilization is a percentage OF the
+          # request. With no request there is no denominator and the HPA
+          # reports <unknown>, scaling nothing. The app HPA beside this
+          # one uses the same absolute target for the same reason.
+          type: AverageValue
+          averageValue: 500m
+  behavior:
+    # Same asymmetry as the app tier: scaling up late costs users their
+    # page, scaling down late costs a few idle pods. Node SSR processes
+    # start in about a second, so up can be aggressive.
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+        - type: Pods
+          value: 4
+          periodSeconds: 15
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 25
+          periodSeconds: 60
+      selectPolicy: Max
 ---
 apiVersion: traefik.io/v1alpha1
 kind: IngressRoute
