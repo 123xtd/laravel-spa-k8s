@@ -55,9 +55,20 @@ live_digest() {
   kubectl get deploy laravel-spa-app -n "$NS" \
     -o jsonpath='{.spec.template.spec.containers[0].image}' | sed 's/.*@//'
 }
+# Sorted by age and taking the LAST, never items[0] -- see the note on
+# running_ssr_digest below, which is the same trap.
+#
+# `rollout status` returns when the new ReplicaSet is complete, NOT when
+# the old pods are gone, so for a few seconds afterwards items[0] is
+# routinely still a terminating pod on the PREVIOUS image. Read that way
+# on 2026-10-27 it returned live's own digest, and step 3 refused a
+# perfectly good build with "CI has not published a new image yet" --
+# a false negative that costs a deploy cycle and sends you looking at CI
+# for a fault that is not there.
 clone_digest() {
   kubectl get pods -n "$NS" -l app=laravel-spa-app-clone \
-    -o jsonpath='{.items[0].status.containerStatuses[0].imageID}' | sed 's/.*@//'
+    --sort-by=.metadata.creationTimestamp \
+    -o jsonpath='{.items[-1:].status.containerStatuses[0].imageID}' | sed 's/.*@//'
 }
 live_ssr_digest() {
   kubectl get deploy laravel-spa-ssr -n "$NS" \
@@ -191,6 +202,7 @@ kubectl -n "$NS" rollout restart deployment/laravel-spa-app-clone >/dev/null || 
 kubectl -n "$NS" rollout status deployment/laravel-spa-app-clone --timeout=400s >/dev/null \
   || die "the clone did not become ready. Its pods are probably failing on the new image -- kubectl logs will say why. Live is untouched."
 NEW=$(clone_digest)
+[ -n "$NEW" ] || die "could not read the clone's digest. Its newest pod may still be pulling -- re-run in a moment. Live is untouched."
 say "  clone now running: ${NEW:0:19}"
 
 # ---- 3. did CI actually publish something new? ----
