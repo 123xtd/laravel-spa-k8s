@@ -1,0 +1,52 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: metrics-roll-up
+  namespace: laravel-spa
+spec:
+  # Every five minutes. The counters have no TTL and rollUp() drains
+  # rather than overwrites, so this interval is not a correctness
+  # boundary -- it only decides how much a cache flush can cost. At five
+  # minutes a deploy that somehow skipped the pre-clear roll-up (see
+  # promote.sh) loses at most five minutes of counts instead of the
+  # entire trailing window, which is what used to happen.
+  schedule: "*/5 * * * *"
+  timeZone: "America/Chicago"
+  # Forbid, not Allow: two overlapping runs would both read a counter
+  # before either subtracted what it banked, and the same views would be
+  # written to the day's row twice.
+  concurrencyPolicy: Forbid
+  # A run that cannot finish inside the interval is not worth queueing
+  # behind the next one.
+  startingDeadlineSeconds: 120
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+            - name: ghcr-pull-secret
+          containers:
+            - name: roll-up-metrics
+              image: ghcr.io/123xtd/laravel-spa-app:latest
+              command: ["php", "artisan", "metrics:roll-up"]
+              workingDir: /var/www/html
+              envFrom:
+                - secretRef:
+                    name: laravel-spa-secrets
+              # The work is a handful of cache reads and at most ten
+              # single-row updates, so this is sized small on purpose.
+              # If it ever needs more, raise the number here and apply
+              # rather than deleting the cap -- see the note in
+              # yard-sales-prune-cronjob.yaml about `kubectl apply` not
+              # clearing a field the manifest stops naming.
+              resources:
+                limits:
+                  cpu: 250m
+                  memory: 256Mi
+                requests:
+                  cpu: 50m
+                  memory: 128Mi

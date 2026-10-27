@@ -15,8 +15,10 @@
 #   4. checks the clone serves 200
 #   5. STOPS for you to look at www.foasfo.ca
 #   6. bumps the digest in app-deployment.yaml and applies it
-#   7. clears the page cache, which otherwise serves the old HTML for
-#      up to PAGE_CACHE_TTL (300s) and makes a good deploy look broken
+#   7. banks the Market pulse counts, then clears the page cache, which
+#      otherwise serves the old HTML for up to PAGE_CACHE_TTL (300s) and
+#      makes a good deploy look broken. The banking comes first because
+#      the clear flushes the whole cache store, counters included
 #   8. checks live serves 200 on both domains
 #
 # Safe to re-run: every step is idempotent, and it exits rather than
@@ -129,6 +131,24 @@ clear_page_cache() {
     2>/dev/null | grep -iE "cleared|error" | sed 's/^/  /'
 }
 
+# Bank the Market pulse counts before anything clears the cache.
+#
+# Those counters live in the cache and are drained into their per-day
+# rows by a CronJob every five minutes. `php artisan cache:clear` below
+# does not clear "the page cache" despite the name -- it flushes the
+# whole store -- so a clear in the gap between two cron runs would throw
+# away whatever had been counted since the last one. Running the roll-up
+# first makes a deploy cost nothing.
+#
+# Deliberately not fatal: a failure here loses a few minutes of view
+# counts, which is not a reason to abandon a release.
+roll_up_metrics() {
+  local session_db="$1" cache_db="$2"
+  kubectl run "promote-ru-$RANDOM" -n "$NS" --rm -i --restart=Never --image="$IMAGE:latest" \
+    --overrides="{\"spec\":{\"imagePullSecrets\":[{\"name\":\"ghcr-pull-secret\"}],\"containers\":[{\"name\":\"runner\",\"image\":\"$IMAGE:latest\",\"workingDir\":\"/var/www/html\",\"command\":[\"php\",\"artisan\",\"metrics:roll-up\"],\"envFrom\":[{\"secretRef\":{\"name\":\"laravel-spa-secrets\"}}],\"env\":[{\"name\":\"REDIS_DB\",\"value\":\"$session_db\"},{\"name\":\"REDIS_CACHE_DB\",\"value\":\"$cache_db\"}]}]}}" \
+    2>/dev/null | grep -iE "rolled|nothing|error" | sed 's/^/  /'
+}
+
 # ---- 1. is there anything to promote? ----
 say ""
 say "=== 1. app repo ==="
@@ -170,6 +190,7 @@ if [ "$CLONE_ONLY" -eq 1 ]; then
   say "=== clearing the clone's page cache ==="
   say "    without this the clone serves HTML rendered before this image,"
   say "    so what you review is not what you would be promoting."
+  roll_up_metrics 2 3
   clear_page_cache 2 3
   say ""
   say "=== stopping here (--clone). Live still on ${BEFORE:0:19} ==="
@@ -202,6 +223,9 @@ say "  rolled out"
 # ---- 7. the step that makes a good deploy look broken ----
 say ""
 say "=== 7. clearing the page cache ==="
+say "    banking the Market pulse counts first -- the clear below flushes"
+say "    the whole store, counters included."
+roll_up_metrics 0 1
 clear_page_cache 0 1
 
 # ---- 8. is the live site actually up? ----
