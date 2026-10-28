@@ -1,0 +1,27 @@
+# Let's Encrypt STAGING, for proving the HTTP-01 path without spending
+# production rate limits or risking a live certificate.
+#
+# Added 2026-10-28. The production certs in this cluster were all issued
+# BEFORE go-live rerouted Traefik, so the ACME path had not actually been
+# exercised since -- a renewal failure would have surfaced first as the
+# live site going down on an expired cert, and buyandsellpage-cert
+# expires 2026-12-12.
+#
+# Staging issues certificates from an untrusted root, so anything using
+# one shows a browser warning. Never point a real IngressRoute at a
+# certificate issued by this. It exists to answer one question: can
+# cert-manager complete an HTTP-01 challenge through this ingress.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    email: cranberian@duck.com
+    privateKeySecretRef:
+      name: letsencrypt-staging-account-key
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: traefik
