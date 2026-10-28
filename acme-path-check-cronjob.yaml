@@ -1,0 +1,133 @@
+# Proves the HTTP-01 certificate path still works, monthly, before a
+# renewal depends on it.
+#
+# Every production certificate here was issued before go-live rerouted
+# Traefik, and none had been issued since -- so the first test of that
+# path would have been the renewal of buyandsellpage-cert in December,
+# and a broken path shows up as the live site going down on an expired
+# certificate. Checked by hand on 2026-10-28 and it worked. This is what
+# keeps that answer current instead of six months stale.
+#
+# It issues a throwaway certificate from Let's Encrypt STAGING for a
+# hostname that already resolves here, waits for it to go Ready, and
+# deletes it. Staging has generous rate limits and its own untrusted
+# root, so nothing this creates can affect a real certificate.
+#
+# A failure fails the Job, which fires AcmePathCheckFailed (see
+# monitoring/10-prometheus.yaml). A check nobody is told about is not a
+# check.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: acme-path-check
+  namespace: laravel-spa
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: acme-path-check
+  namespace: laravel-spa
+rules:
+  # Exactly what the script below does and nothing more. It cannot touch
+  # the production certificates by name because it only ever creates and
+  # deletes ones it named itself -- but RBAC does not express that, so
+  # the blast radius is deliberately kept to this one namespace.
+  - apiGroups: ["cert-manager.io"]
+    resources: ["certificates"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: acme-path-check
+  namespace: laravel-spa
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: acme-path-check
+subjects:
+  - kind: ServiceAccount
+    name: acme-path-check
+    namespace: laravel-spa
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: acme-path-check
+  namespace: laravel-spa
+spec:
+  # 04:10 on the 1st. Monthly is often enough to catch a break weeks
+  # before a renewal needs the path, and rare enough that it is not
+  # worth thinking about.
+  schedule: "10 4 1 * *"
+  timeZone: "America/Chicago"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  # Kept deliberately: kube-state-metrics only reports Jobs that still
+  # exist, and AcmePathCheckStale reads the last completion time off
+  # them. Prune these and the staleness alert goes blind.
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          serviceAccountName: acme-path-check
+          containers:
+            - name: check
+              # :latest, which is not the house style, and not a choice.
+              # Bitnami moved its versioned tags out of the free catalog;
+              # registry.k8s.io/kubectl and alpine/kubectl both failed to
+              # pull here, and 1.36/1.37 tags on this repo do not exist.
+              # Verified working: v1.37.2 against a v1.36 cluster, which
+              # is inside kubectl's supported skew.
+              image: bitnami/kubectl:latest
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -u
+                  NAME="acme-check-$(date +%Y%m%d%H%M%S)"
+
+                  # Cleanup on every exit path, including the timeout
+                  # below. A failed check that leaves a Certificate
+                  # behind would have cert-manager retrying it forever.
+                  cleanup() {
+                    kubectl delete certificate "$NAME" -n laravel-spa --ignore-not-found --wait=false || true
+                    kubectl delete secret "$NAME-tls" -n laravel-spa --ignore-not-found --wait=false || true
+                  }
+                  trap cleanup EXIT
+
+                  echo "Requesting a STAGING certificate as $NAME ..."
+                  cat <<EOF | kubectl apply -f -
+                  apiVersion: cert-manager.io/v1
+                  kind: Certificate
+                  metadata:
+                    name: $NAME
+                    namespace: laravel-spa
+                  spec:
+                    secretName: $NAME-tls
+                    issuerRef:
+                      name: letsencrypt-staging
+                      kind: ClusterIssuer
+                    dnsNames:
+                      - buyandsellpage.ca
+                  EOF
+
+                  # Non-zero on timeout, which fails the Job, which is
+                  # what the alert watches. Took ~35s by hand; ten
+                  # minutes is slack for a slow ACME day, not a target.
+                  kubectl wait --for=condition=Ready \
+                    "certificate/$NAME" -n laravel-spa --timeout=600s
+              resources:
+                limits:
+                  cpu: 250m
+                  memory: 256Mi
+                requests:
+                  cpu: 50m
+                  memory: 128Mi

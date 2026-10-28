@@ -329,6 +329,39 @@ data:
             annotations:
               summary: "A TLS certificate expires in {{ $value | printf \"%.0f\" }} days and has not renewed"
 
+          # The monthly HTTP-01 proof (acme-path-check-cronjob.yaml). It
+          # issues a throwaway staging certificate and fails the Job if
+          # it does not go Ready, so this firing means cert-manager
+          # could not complete a challenge -- and the next REAL renewal
+          # will fail the same way, taking the site down on an expired
+          # certificate when it does.
+          #
+          # TLSCertificateExpiringSoon below catches that too, but only
+          # once a certificate is inside 14 days. This says it weeks
+          # earlier, while it is still a quiet afternoon's work.
+          - alert: AcmePathCheckFailed
+            expr: max(kube_job_failed{job_name=~"acme-path-check.*"}) > 0
+            for: 10m
+            labels: { severity: warning }
+            annotations:
+              summary: "The monthly HTTP-01 check failed -- certificate renewals will fail too"
+
+          # The other way this goes wrong: the check stops running at
+          # all, and silence reads exactly like success. 40 days, so a
+          # single missed monthly run is enough to say so.
+          #
+          # absent() covers the CronJob being deleted outright, which
+          # takes the series with it and would otherwise be invisible.
+          - alert: AcmePathCheckStale
+            expr: >
+              (time() - max(kube_job_status_completion_time{job_name=~"acme-path-check.*"}))
+                > 40 * 86400
+              or absent(kube_job_status_completion_time{job_name=~"acme-path-check.*"})
+            for: 1h
+            labels: { severity: warning }
+            annotations:
+              summary: "The HTTP-01 check has not completed in over 40 days, so nothing is proving renewals still work"
+
           # Prometheus holds the only record of what happened. It filling
           # up ends the record, which is how three days of soak data was
           # nearly lost before a size cap was added.
