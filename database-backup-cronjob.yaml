@@ -7,7 +7,7 @@ spec:
   schedule: "0 4 * * *"
   # Central Time, same as yard-sales-prune-ended — offset an hour later
   # (4am vs 3am) so the two scheduled jobs don't compete for resources.
-  timeZone: "America/Chicago"
+  timeZone: "America/Winnipeg"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 7
   failedJobsHistoryLimit: 7

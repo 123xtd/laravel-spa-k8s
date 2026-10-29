@@ -46,7 +46,7 @@ metadata:
   namespace: laravel-spa
 spec:
   schedule: "0 5 * * *"
-  timeZone: "America/Chicago"
+  timeZone: "America/Winnipeg"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3

@@ -63,7 +63,7 @@ spec:
   # before a renewal needs the path, and rare enough that it is not
   # worth thinking about.
   schedule: "10 4 1 * *"
-  timeZone: "America/Chicago"
+  timeZone: "America/Winnipeg"
   concurrencyPolicy: Forbid
   startingDeadlineSeconds: 3600
   # Kept deliberately: kube-state-metrics only reports Jobs that still

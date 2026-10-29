@@ -5,10 +5,14 @@ metadata:
   namespace: laravel-spa
 spec:
   schedule: "0 3 * * *"
-  # Central Time, not UTC — 3am here is 4am Eastern / 1am Pacific. The
-  # cluster (k8s 1.36) handles CST/CDT automatically, no manual
-  # UTC-offset math.
-  timeZone: "America/Chicago"
+  # Manitoba time, not UTC and not Central — 3am means 3am here.
+  #
+  # Was America/Chicago. Manitoba stopped observing daylight time as of
+  # 2026, so Chicago drops to UTC-6 on 1 November while Winnipeg stays at
+  # UTC-5; this job would have started running at 4am local for half the
+  # year while still claiming 3am. tzdata encodes the Manitoba rule
+  # already, so this needs no offset maths and no maintenance.
+  timeZone: "America/Winnipeg"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3

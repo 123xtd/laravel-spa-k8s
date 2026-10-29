@@ -11,7 +11,7 @@ spec:
   # promote.sh) loses at most five minutes of counts instead of the
   # entire trailing window, which is what used to happen.
   schedule: "*/5 * * * *"
-  timeZone: "America/Chicago"
+  timeZone: "America/Winnipeg"
   # Forbid, not Allow: two overlapping runs would both read a counter
   # before either subtracted what it banked, and the same views would be
   # written to the day's row twice.
