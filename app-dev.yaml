@@ -138,6 +138,14 @@ spec:
             - secretRef:
                 name: laravel-spa-secrets
           env:
+            # Container labels (COMET1, STARSHIP3, NEBULA...) on screen.
+            # Set HERE and nowhere else: they are a working aid for
+            # describing where something is, and no visitor to the real
+            # site should ever see them. config/app.php defaults it to
+            # false, so live and the clone are unaffected by omission
+            # rather than by remembering to turn it off.
+            - name: SHOW_CONTAINER_LABELS
+              value: "true"
             # DB_* come from `env` rather than a second envFrom, so the
             # precedence is explicit rather than depending on ordering:
             # env always beats envFrom. These point at saturn and are the
