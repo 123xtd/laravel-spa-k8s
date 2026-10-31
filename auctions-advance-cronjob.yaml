@@ -1,0 +1,75 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: auctions-advance
+  namespace: laravel-spa
+spec:
+  # Every minute, unlike the daily prunes.
+  #
+  # Lateness here is visible to people. An auction left open past its
+  # closing time is taking bids it should not, and one that opens late
+  # is an item a seller was promised would be live. Five-minute
+  # granularity would mean an auction can run up to five minutes past
+  # its own published close, which is not a thing to explain to a
+  # losing bidder.
+  #
+  # The cost is a pod a minute. `successfulJobsHistoryLimit: 1` keeps
+  # the clutter down, and the command exits silently when there is
+  # nothing to move.
+  schedule: "* * * * *"
+  timeZone: "America/Winnipeg"
+
+  # Forbid, not Replace. The command is safe to run twice -- every
+  # state change is conditional on the state it is moving from -- but
+  # there is no reason to have two of them racing, and Forbid makes a
+  # slow run visible as a skip rather than hiding it under a pile-up.
+  concurrencyPolicy: Forbid
+
+  # A missed minute is a missed minute. Without this, a cluster that
+  # was down for an hour starts sixty jobs at once on recovery.
+  startingDeadlineSeconds: 45
+
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+            - name: ghcr-pull-secret
+          containers:
+            - name: advance-auctions
+              # NOT APPLIED TO THE CLUSTER YET -- see the note at the
+              # bottom of this file before you `kubectl apply` it.
+              image: ghcr.io/123xtd/laravel-spa-app:latest
+              command: ["php", "artisan", "auctions:advance"]
+              workingDir: /var/www/html
+              envFrom:
+                - secretRef:
+                    name: laravel-spa-secrets
+              securityContext:
+                allowPrivilegeEscalation: false
+                runAsNonRoot: true
+                runAsUser: 82
+                runAsGroup: 82
+                capabilities:
+                  drop: ["ALL"]
+                seccompProfile:
+                  type: RuntimeDefault
+# ---------------------------------------------------------------------
+# WHY THIS IS NOT APPLIED YET
+#
+# The image is `:latest`, and live deliberately runs a pinned digest.
+# Applying this today would point unreleased auction code at the LIVE
+# database every sixty seconds -- a no-op while no live listing has an
+# auction, but exactly the discipline digest-pinning exists to keep.
+#
+# Apply it when the auction feature is released, and pin it to the same
+# digest the live deployment is on at that moment, the way promote.sh
+# does for the app.
+#
+# Until then the dev tier advances auctions by hand:
+#   kubectl exec -n laravel-spa <dev pod> -- php artisan auctions:advance
+# ---------------------------------------------------------------------
